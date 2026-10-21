@@ -124,5 +124,18 @@
   "file_sending": "Envoi",
   "file_sent": "Envoyé",
   "file_unshared": "Envoi annulé",
-  "fileKeepHint": "Gardez le fichier à sa place tant que {name} ne l'a pas téléchargé."
+  "fileKeepHint": "Gardez le fichier à sa place tant que {name} ne l'a pas téléchargé.",
+  "edit": "Modifier",
+  "delete": "Supprimer",
+  "edited": "modifié",
+  "editing": "Modification d'un message",
+  "escToCancel": "Échap pour annuler",
+  "deleteTitle": "Supprimer ce message ?",
+  "deleteForEveryone": "Supprimer pour tout le monde",
+  "deleteForMe": "Supprimer pour moi",
+  "deleteHint": "« Pour tout le monde » le retire aussi de l'appareil de votre contact.",
+  "mediaUnavailable": "Aperçu indisponible",
+  "downloads": "Téléchargements",
+  "openDownloadDir": "Ouvrir le dossier de téléchargement",
+  "downloadsHint": "Les fichiers reçus sont enregistrés dans Téléchargements\\OutpostWave."
 }

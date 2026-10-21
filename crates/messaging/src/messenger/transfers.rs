@@ -160,11 +160,35 @@ impl Messenger {
         let key = FileKey::generate().map_err(|_| MessagingError::Io("RNG failure".into()))?;
         let device = ow_identity::DeviceKey::from_secret_bytes(&inner.device.to_secret_bytes());
         let (p, k) = (path.clone(), key.clone());
-        let manifest =
-            tokio::task::spawn_blocking(move || ow_files::prepare(&p, &k, &device, |_| {}))
-                .await
-                .map_err(|_| MessagingError::Io("interrupted".into()))?
-                .map_err(|e| MessagingError::Io(e.to_string()))?;
+        let size = std::fs::metadata(&path)
+            .map_err(|e| MessagingError::Io(e.to_string()))?
+            .len();
+        let events = inner.events.clone();
+        let event_name = name.clone();
+        let progress = move |bytes: u64| {
+            let _ = events.send(MessengerEvent::Preparing {
+                contact,
+                name: event_name.clone(),
+                bytes,
+                size,
+            });
+        };
+        progress(0);
+        let report = progress.clone();
+        let manifest = tokio::task::spawn_blocking(move || {
+            let mut last = Instant::now();
+            ow_files::prepare(&p, &k, &device, |b| {
+                if last.elapsed() >= EVENT_EVERY {
+                    last = Instant::now();
+                    report(b);
+                }
+            })
+        })
+        .await
+        .map_err(|_| MessagingError::Io("interrupted".into()));
+        // Always end the "preparing" state, even on error.
+        progress(size);
+        let manifest = manifest?.map_err(|e| MessagingError::Io(e.to_string()))?;
         let now = now_ms();
         let s = lock(&inner.storage);
         if s.contact(contact)?.is_none() {
@@ -216,6 +240,7 @@ impl Messenger {
             status: MessageStatus::Pending,
             body: new.body,
             file_id: new.file_id,
+            edited_at: None,
         };
         let _ = inner.events.send(MessengerEvent::Message {
             contact,

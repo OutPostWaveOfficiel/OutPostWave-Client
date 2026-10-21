@@ -50,3 +50,8 @@ panic = "abort"
 [profile.dev.package."*"]
 # Optimize dependencies in dev builds (audio/video code is unusable unoptimized).
 opt-level = 2
+
+[profile.dev.package.ow-files]
+# Generic crypto code (ChaCha20, BLAKE3) is compiled into this crate: unoptimized, preparing a
+# 1.4 GB file takes minutes instead of seconds.
+opt-level = 2

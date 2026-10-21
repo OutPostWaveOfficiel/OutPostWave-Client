@@ -34,6 +34,7 @@ export interface FileTransfer {
   bytes: number;
   rate: number;
   openable: boolean;
+  media: "image" | "video" | "audio" | null;
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "received";
@@ -46,6 +47,7 @@ export interface Message {
   status: MessageStatus;
   body: string;
   file: FileTransfer | null;
+  editedAt: number | null;
 }
 
 export interface Settings {
@@ -72,6 +74,9 @@ export type OwEvent =
   | { type: "keyChanged"; contact: number }
   | { type: "contactRequest"; contact: number }
   | { type: "file"; contact: number; file: FileTransfer }
+  | { type: "preparing"; contact: number; name: string; bytes: number; size: number }
+  | { type: "messageEdited"; contact: number; message: Message }
+  | { type: "messageDeleted"; contact: number; msgId: string }
   | { type: "resync" };
 
 export const api = {
@@ -104,6 +109,11 @@ export const api = {
   pauseFile: (file: string) => invoke<void>("pause_file", { file }),
   cancelFile: (file: string) => invoke<void>("cancel_file", { file }),
   openFile: (file: string, reveal: boolean) => invoke<void>("open_file", { file, reveal }),
+  editMessage: (contact: number, msg: string, text: string) =>
+    invoke<Message>("edit_message", { contact, msg, text }),
+  deleteMessage: (contact: number, msg: string, forEveryone: boolean) =>
+    invoke<void>("delete_message", { contact, msg, forEveryone }),
+  openDownloadDir: () => invoke<void>("open_download_dir"),
   getPrefs: () => invoke<{ sounds: boolean }>("get_prefs"),
   setEmail: (email: string) => invoke<void>("set_email", { email }),
   verifyEmail: (code: string) => invoke<void>("verify_email", { code }),
@@ -120,6 +130,13 @@ export const api = {
   onEvent: (cb: (e: OwEvent) => void): Promise<UnlistenFn> =>
     listen<OwEvent>("ow-event", (e) => cb(e.payload)),
 };
+
+/** URL of a complete file for `<img>`, `<video>` and `<audio>` (served by the Rust core). */
+export function mediaUrl(fileId: string): string {
+  const internals = (window as unknown as { __TAURI_INTERNALS__?: { convertFileSrc: (p: string, s: string) => string } })
+    .__TAURI_INTERNALS__;
+  return internals ? internals.convertFileSrc(fileId, "owfile") : `owfile://localhost/${fileId}`;
+}
 
 /** Error codes returned by the backend that have a translated message. */
 const KNOWN_ERRORS = [

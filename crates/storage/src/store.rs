@@ -437,9 +437,9 @@ impl Storage {
     ) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
-                    status, body, file_id
+                    status, body, file_id, edited_at
              FROM messages
-             WHERE conversation_id = ?1 AND id < ?2
+             WHERE conversation_id = ?1 AND id < ?2 AND deleted = 0
              ORDER BY sent_at DESC, id DESC
              LIMIT ?3",
         )?;
@@ -458,9 +458,9 @@ impl Storage {
     pub fn contact_messages(&self, contact: ContactId, limit: u32) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT m.id, m.conversation_id, m.msg_id, m.sender_device, m.outgoing, m.sent_at,
-                    m.received_at, m.status, m.body, m.file_id
+                    m.received_at, m.status, m.body, m.file_id, m.edited_at
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
-             WHERE c.contact_id = ?1
+             WHERE c.contact_id = ?1 AND m.deleted = 0
              ORDER BY m.sent_at DESC, m.id DESC
              LIMIT ?2",
         )?;
@@ -476,9 +476,9 @@ impl Storage {
     pub fn undelivered(&self, conversation: ConversationId) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
-                    status, body, file_id
+                    status, body, file_id, edited_at
              FROM messages
-             WHERE conversation_id = ?1 AND outgoing = 1 AND status < 2
+             WHERE conversation_id = ?1 AND outgoing = 1 AND status < 2 AND deleted = 0
              ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map([conversation.0], message_from_row)?;
@@ -610,6 +610,52 @@ impl Storage {
         rows.map(|r| to_array(&r?, "message id")).collect()
     }
 
+    /// A message by its id. Returns it with its `deleted` flag (deleted messages are tombstones
+    /// with an empty body).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn message_by_msg_id(&self, msg_id: &[u8; 16]) -> Result<Option<(StoredMessage, bool)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
+                    status, body, file_id, edited_at, deleted
+             FROM messages WHERE msg_id = ?1",
+        )?;
+        stmt.query_row([&msg_id[..]], |r| {
+            let deleted: bool = r.get(11)?;
+            Ok(message_from_row(r)?.map(|m| (m, deleted)))
+        })
+        .optional()?
+        .transpose()
+    }
+
+    /// Replaces the text of a message. Returns `false` if it does not exist or was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn edit_message(&self, msg_id: &[u8; 16], body: &str, edited_at: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET body = ?2, edited_at = ?3 WHERE msg_id = ?1 AND deleted = 0",
+            params![&msg_id[..], body, edited_at],
+        )? == 1)
+    }
+
+    /// Deletes a message, keeping a tombstone (empty body) so a late duplicate is ignored.
+    /// Returns `false` if it does not exist or was already deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn delete_message(&self, msg_id: &[u8; 16]) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET deleted = 1, body = '', edited_at = NULL
+             WHERE msg_id = ?1 AND deleted = 0",
+            [&msg_id[..]],
+        )? == 1)
+    }
+
     /// Number of unread incoming messages from a contact.
     ///
     /// # Errors
@@ -618,7 +664,7 @@ impl Storage {
     pub fn unread_count(&self, contact: ContactId) -> Result<u32> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id
-             WHERE c.contact_id = ?1 AND m.outgoing = 0 AND m.status = 4",
+             WHERE c.contact_id = ?1 AND m.outgoing = 0 AND m.status = 4 AND m.deleted = 0",
             [contact.0],
             |r| r.get(0),
         )?)
@@ -716,6 +762,7 @@ fn message_from_row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage>> {
             status: MessageStatus::from_i64(status).ok_or(StorageError::InvalidData("status"))?,
             body: r.get(8)?,
             file_id: file_id.map(|f| to_array(&f, "file id")).transpose()?,
+            edited_at: r.get(10)?,
         })
     })())
 }
@@ -964,6 +1011,33 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(s.conversation_contact(conv).unwrap(), Some(c));
+
+        // Edit and delete.
+        assert!(s.edit_message(&[10; 16], "renamed", 99).unwrap());
+        let (em, deleted) = s.message_by_msg_id(&[10; 16]).unwrap().unwrap();
+        assert_eq!(
+            (em.body.as_str(), em.edited_at, deleted),
+            ("renamed", Some(99), false)
+        );
+        let before = s.messages(conv, None, 100).unwrap().len();
+        assert!(s.delete_message(&[10; 16]).unwrap());
+        assert!(!s.delete_message(&[10; 16]).unwrap());
+        assert!(
+            !s.edit_message(&[10; 16], "back", 100).unwrap(),
+            "no edit after delete"
+        );
+        assert_eq!(s.messages(conv, None, 100).unwrap().len(), before - 1);
+        assert!(s.message_by_msg_id(&[10; 16]).unwrap().unwrap().1);
+        // A late duplicate does not bring it back.
+        assert!(
+            s.insert_message(&NewMessage {
+                msg_id: [10; 16],
+                ..incoming.clone()
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(s.messages(conv, None, 100).unwrap().len(), before - 1);
 
         // Key change: a new contact entry (same person, new identity) is merged into the old one.
         let c_new = s

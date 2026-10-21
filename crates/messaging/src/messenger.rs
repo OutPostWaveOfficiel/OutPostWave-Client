@@ -67,6 +67,29 @@ fn key_name(prefix: &str, device: &[u8; 32]) -> String {
     format!("{prefix}:{}", base32::encode(device))
 }
 
+/// Queued control frames: `len u32 BE | frame`, repeated.
+fn encode_outbox(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in frames {
+        out.extend_from_slice(&u32::try_from(f.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+fn decode_outbox(mut b: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        if b.len() < 4 + len {
+            break;
+        }
+        out.push(b[4..4 + len].to_vec());
+        b = &b[4 + len..];
+    }
+    out
+}
+
 fn encode_addrs(addrs: &[Multiaddr]) -> Vec<u8> {
     let mut out = Vec::new();
     for a in addrs.iter().take(16) {
@@ -266,6 +289,20 @@ pub enum MessengerEvent {
         /// The message.
         message: StoredMessage,
     },
+    /// A message was edited (by us or by its author).
+    MessageEdited {
+        /// Contact of the conversation.
+        contact: ContactId,
+        /// The message with its new text.
+        message: StoredMessage,
+    },
+    /// A message was deleted.
+    MessageDeleted {
+        /// Contact of the conversation.
+        contact: ContactId,
+        /// Message id.
+        msg_id: [u8; 16],
+    },
     /// The status of an outgoing message changed.
     Status {
         /// Contact of the conversation.
@@ -286,6 +323,17 @@ pub enum MessengerEvent {
     KeyChanged {
         /// Contact.
         contact: ContactId,
+    },
+    /// A file is being read before it is offered (about 1 s per GB). `bytes == size` when done.
+    Preparing {
+        /// Contact the file is for.
+        contact: ContactId,
+        /// File name.
+        name: String,
+        /// Bytes read.
+        bytes: u64,
+        /// File size.
+        size: u64,
     },
     /// A file transfer progressed or changed state.
     File {
@@ -679,6 +727,7 @@ impl Messenger {
                 status: MessageStatus::Pending,
                 body: new.body,
                 file_id: None,
+                edited_at: None,
             }
         };
         let _ = inner.events.send(MessengerEvent::Message {
@@ -687,6 +736,90 @@ impl Messenger {
         });
         Inner::spawn_delivery(inner, contact);
         Ok(message)
+    }
+
+    /// Edits one of our text messages. The contact sees the new text, marked as edited.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::InvalidText`], [`MessagingError::NotAllowed`] (not our text message),
+    /// [`MessagingError::UnknownMessage`] or storage errors.
+    pub fn edit_message(
+        &self,
+        contact: ContactId,
+        msg_id: &[u8; 16],
+        text: &str,
+    ) -> Result<StoredMessage> {
+        let inner = &self.inner;
+        let text = text.trim();
+        if text.is_empty() || text.len() > MAX_TEXT_LEN {
+            return Err(MessagingError::InvalidText);
+        }
+        let original = inner.own_message(contact, msg_id)?;
+        if !original.outgoing || original.file_id.is_some() {
+            return Err(MessagingError::NotAllowed);
+        }
+        let now = now_ms();
+        let s = lock(&inner.storage);
+        s.edit_message(msg_id, text, now)?;
+        // Not sent yet: the new text simply goes out with the message.
+        if original.status != MessageStatus::Pending {
+            inner.queue_frame(&s, contact, &Frame::encode_edit(msg_id, now, text))?;
+        }
+        let (message, _) = s
+            .message_by_msg_id(msg_id)?
+            .ok_or(MessagingError::UnknownMessage)?;
+        drop(s);
+        let _ = inner.events.send(MessengerEvent::MessageEdited {
+            contact,
+            message: message.clone(),
+        });
+        inner
+            .backup_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Inner::spawn_delivery(inner, contact);
+        Ok(message)
+    }
+
+    /// Deletes a message for us, or for everyone (our own messages only). Deleting a file
+    /// message stops its transfer; an already downloaded file stays on disk.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NotAllowed`] (deleting someone else's message for everyone),
+    /// [`MessagingError::UnknownMessage`] or storage errors.
+    pub fn delete_message(
+        &self,
+        contact: ContactId,
+        msg_id: &[u8; 16],
+        for_everyone: bool,
+    ) -> Result<()> {
+        let inner = &self.inner;
+        let original = inner.own_message(contact, msg_id)?;
+        if for_everyone && !original.outgoing {
+            return Err(MessagingError::NotAllowed);
+        }
+        if let Some(file) = original.file_id {
+            let _ = self.cancel_file(&file);
+        }
+        {
+            let s = lock(&inner.storage);
+            s.delete_message(msg_id)?;
+            if for_everyone && original.status != MessageStatus::Pending {
+                inner.queue_frame(&s, contact, &Frame::encode_delete(&[*msg_id]))?;
+            }
+        }
+        let _ = inner.events.send(MessengerEvent::MessageDeleted {
+            contact,
+            msg_id: *msg_id,
+        });
+        inner
+            .backup_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if for_everyone {
+            Inner::spawn_delivery(inner, contact);
+        }
+        Ok(())
     }
 
     /// Marks the conversation with `contact` as read. If read receipts are enabled, the contact
@@ -1216,6 +1349,92 @@ impl Inner {
         Ok(count)
     }
 
+    /// The message `msg_id` of `contact`'s conversation (not deleted).
+    fn own_message(&self, contact: ContactId, msg_id: &[u8; 16]) -> Result<StoredMessage> {
+        let s = lock(&self.storage);
+        let conv = s.dm_conversation(contact, now_ms())?;
+        match s.message_by_msg_id(msg_id)? {
+            Some((m, false)) if m.conversation == conv => Ok(m),
+            _ => Err(MessagingError::UnknownMessage),
+        }
+    }
+
+    /// Queues a control frame (edit, delete) for `contact`.
+    fn queue_frame(&self, s: &Storage, contact: ContactId, frame: &[u8]) -> Result<()> {
+        let _ = self;
+        let key = format!("outbox:{}", contact.0);
+        let mut frames = s
+            .get_secret(&key)?
+            .map(|b| decode_outbox(&b))
+            .unwrap_or_default();
+        frames.push(frame.to_vec());
+        s.put_secret(&key, &encode_outbox(&frames), now_ms())?;
+        Ok(())
+    }
+
+    fn known_contact(&self, device: &[u8; 32]) -> Result<ContactId> {
+        Ok(lock(&self.storage)
+            .contact_by_device(device)?
+            .ok_or(MessagingError::UnknownContact)?
+            .id)
+    }
+
+    /// The incoming message `msg_id`, if `contact` wrote it.
+    fn authored_by(&self, contact: ContactId, msg_id: &[u8; 16]) -> Result<Option<StoredMessage>> {
+        let s = lock(&self.storage);
+        let Some((m, false)) = s.message_by_msg_id(msg_id)? else {
+            return Ok(None);
+        };
+        let author = s.contact_by_device(&m.sender_device)?.map(|c| c.id);
+        Ok((!m.outgoing && author == Some(contact)).then_some(m))
+    }
+
+    fn apply_edit(
+        &self,
+        contact: ContactId,
+        msg_id: &[u8; 16],
+        edited_at: i64,
+        body: &str,
+    ) -> Result<()> {
+        let Some(m) = self.authored_by(contact, msg_id)? else {
+            tracing::debug!("edit of an unknown or foreign message ignored");
+            return Ok(());
+        };
+        if m.file_id.is_some() || m.edited_at.is_some_and(|t| t >= edited_at) {
+            return Ok(());
+        }
+        let s = lock(&self.storage);
+        s.edit_message(msg_id, body, edited_at)?;
+        if let Some((message, _)) = s.message_by_msg_id(msg_id)? {
+            let _ = self
+                .events
+                .send(MessengerEvent::MessageEdited { contact, message });
+        }
+        Ok(())
+    }
+
+    fn apply_delete(self: &Arc<Self>, contact: ContactId, ids: &[[u8; 16]]) -> Result<()> {
+        for msg_id in ids {
+            let Some(m) = self.authored_by(contact, msg_id)? else {
+                continue;
+            };
+            if let Some(file) = m.file_id {
+                // The sender withdrew the file: stop the download (keep a finished file).
+                let _ = (Messenger {
+                    inner: Arc::clone(self),
+                })
+                .cancel_file(&file);
+            }
+            if lock(&self.storage).delete_message(msg_id)? {
+                let _ = self.events.send(MessengerEvent::MessageDeleted {
+                    contact,
+                    msg_id: *msg_id,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Known direct addresses of `peer`, then circuits through our relays.
     fn dial_addrs(&self, peer: PeerId) -> Vec<Multiaddr> {
         let mut addrs = lock(&self.net)
@@ -1404,7 +1623,12 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
-        if pending.is_empty() && receipts.is_empty() {
+        let outbox_key = format!("outbox:{}", contact.0);
+        let outbox = lock(&self.storage)
+            .get_secret(&outbox_key)?
+            .map(|b| decode_outbox(&b))
+            .unwrap_or_default();
+        if pending.is_empty() && receipts.is_empty() && outbox.is_empty() {
             return Ok(());
         }
         for device in devices {
@@ -1427,6 +1651,16 @@ impl Inner {
                     )));
                 }
             }
+            // Edits and deletions, after the messages they refer to.
+            for frame in &outbox {
+                let bundle = lock(&self.storage).get_secret(&key_name("bundle", &device))?;
+                let envelope = self.encrypt_payload(&device, frame, bundle)?;
+                if self.p2p.send(peer, envelope).await? != ACK_OK {
+                    return Err(MessagingError::P2p(ow_p2p::P2pError::Send(
+                        "rejected".into(),
+                    )));
+                }
+            }
             for chunk in receipts.chunks(MAX_RECEIPT_IDS) {
                 let bundle = lock(&self.storage).get_secret(&key_name("bundle", &device))?;
                 let envelope =
@@ -1436,6 +1670,20 @@ impl Inner {
         }
         if !receipts.is_empty() {
             lock(&self.storage).delete_secret(&receipts_key)?;
+        }
+        if !outbox.is_empty() {
+            // Frames queued meanwhile are kept for the next pass.
+            let s = lock(&self.storage);
+            let now = s
+                .get_secret(&outbox_key)?
+                .map(|b| decode_outbox(&b))
+                .unwrap_or_default();
+            let rest: Vec<Vec<u8>> = now.into_iter().skip(outbox.len()).collect();
+            if rest.is_empty() {
+                s.delete_secret(&outbox_key)?;
+            } else {
+                s.put_secret(&outbox_key, &encode_outbox(&rest), now_ms())?;
+            }
         }
         Ok(())
     }
@@ -1456,6 +1704,20 @@ impl Inner {
         let plaintext = Zeroizing::new(peer.decrypt(&mut crypto.account, &envelope, &dev)?);
         let frame = match Frame::decode(&plaintext)? {
             Frame::Text(frame) => frame,
+            Frame::Edit {
+                msg_id,
+                edited_at,
+                body,
+            } => {
+                let contact = self.known_contact(&device)?;
+                self.save_crypto(crypto, &device)?;
+                return self.apply_edit(contact, &msg_id, edited_at, &body);
+            }
+            Frame::Delete(ids) => {
+                let contact = self.known_contact(&device)?;
+                self.save_crypto(crypto, &device)?;
+                return self.apply_delete(contact, &ids);
+            }
             Frame::Receipt(ids) => {
                 let s = lock(&self.storage);
                 let contact = s
@@ -1541,6 +1803,7 @@ impl Inner {
                 status: MessageStatus::Received,
                 body: new.body,
                 file_id: new.file_id,
+                edited_at: None,
             };
             drop(s);
             if let Some(f) = &offer {

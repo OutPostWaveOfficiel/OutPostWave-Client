@@ -124,5 +124,18 @@
   "file_sending": "Sending",
   "file_sent": "Sent",
   "file_unshared": "Sending cancelled",
-  "fileKeepHint": "Keep the file where it is until {name} has downloaded it."
+  "fileKeepHint": "Keep the file where it is until {name} has downloaded it.",
+  "edit": "Edit",
+  "delete": "Delete",
+  "edited": "edited",
+  "editing": "Editing a message",
+  "escToCancel": "Esc to cancel",
+  "deleteTitle": "Delete this message?",
+  "deleteForEveryone": "Delete for everyone",
+  "deleteForMe": "Delete for me",
+  "deleteHint": "\"For everyone\" also removes it from your contact's device.",
+  "mediaUnavailable": "Preview unavailable",
+  "downloads": "Downloads",
+  "openDownloadDir": "Open the download folder",
+  "downloadsHint": "Received files are saved in Downloads\\OutpostWave."
 }

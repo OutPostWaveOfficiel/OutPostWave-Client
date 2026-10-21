@@ -1,5 +1,5 @@
 // Main screen: contact list + conversation.
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import {
   api,
@@ -9,6 +9,7 @@ import {
   type Invite,
   type Message,
   type Settings,
+  mediaUrl,
 } from "../api";
 import { Dialog } from "../components/Dialog";
 import { chime, setBadge } from "../notify";
@@ -34,6 +35,8 @@ export function Main(props: { handle: string; os: string; server: string | null 
   const [sounds, setSounds] = createSignal(true);
   const loadPrefs = () => api.getPrefs().then((p) => setSounds(p.sounds)).catch(() => {});
   const [selected, setSelected] = createSignal<number | null>(null);
+  // Files being read before they are offered, per contact.
+  const [preparing, setPreparing] = createSignal<Record<number, { name: string; bytes: number; size: number }>>({});
   // Messages per contact, oldest first.
   const [messages, setMessages] = createStore<Record<number, Message[]>>({});
   const [dialog, setDialog] = createSignal<"invite" | "add" | "safety" | "settings" | null>(null);
@@ -98,6 +101,24 @@ export function Main(props: { handle: string; os: string; server: string | null 
               else void loadContacts();
               notify("message");
             }
+          }
+          break;
+        case "preparing":
+          setPreparing((all) => {
+            const next = { ...all };
+            if (e.bytes >= e.size) delete next[e.contact];
+            else next[e.contact] = { name: e.name, bytes: e.bytes, size: e.size };
+            return next;
+          });
+          break;
+        case "messageEdited":
+          if (messages[e.contact]) {
+            setMessages(e.contact, (m) => m.msgId === e.message.msgId, e.message);
+          }
+          break;
+        case "messageDeleted":
+          if (messages[e.contact]) {
+            setMessages(e.contact, (list) => list.filter((m) => m.msgId !== e.msgId));
           }
           break;
         case "file":
@@ -183,6 +204,7 @@ export function Main(props: { handle: string; os: string; server: string | null 
               messages={messages[c().id] ?? []}
               onOlder={() => loadOlder(c().id)}
               onSafety={() => setDialog("safety")}
+              preparing={preparing()[c().id] ?? null}
               onAck={async () => {
                 await api.ackKeyChange(c().id);
                 void loadContacts();
@@ -233,10 +255,40 @@ function Conversation(props: {
   onOlder: () => void;
   onSafety: () => void;
   onAck: () => void;
+  preparing: { name: string; bytes: number; size: number } | null;
 }) {
   const [text, setText] = createSignal("");
   const [error, setError] = createSignal("");
   const [preparing, setPreparing] = createSignal(false);
+  const [editing, setEditing] = createSignal<Message | null>(null);
+  const [deleting, setDeleting] = createSignal<Message | null>(null);
+  const [viewer, setViewer] = createSignal<FileTransfer | null>(null);
+  let input: HTMLInputElement | undefined;
+
+  function startEdit(m: Message) {
+    setEditing(m);
+    setText(m.body);
+    queueMicrotask(() => input?.focus());
+  }
+
+  function stopEdit() {
+    setEditing(null);
+    setText("");
+  }
+
+  function onComposerKey(e: KeyboardEvent) {
+    if (e.key === "Escape" && editing()) {
+      e.preventDefault();
+      stopEdit();
+    } else if (e.key === "ArrowUp" && !text() && !editing()) {
+      // Like Discord: edit the last message we wrote.
+      const last = [...props.messages].reverse().find((m) => m.outgoing && !m.file);
+      if (last) {
+        e.preventDefault();
+        startEdit(last);
+      }
+    }
+  }
   const [dragging, setDragging] = createSignal(false);
   let list: HTMLDivElement | undefined;
   const name = () => props.contact.displayName ?? props.contact.handle;
@@ -284,6 +336,12 @@ function Conversation(props: {
     if (!body) return;
     setError("");
     try {
+      const target = editing();
+      if (target) {
+        if (body !== target.body) await api.editMessage(props.contact.id, target.msgId, body);
+        stopEdit();
+        return;
+      }
       await api.sendMessage(props.contact.id, body);
       setText("");
     } catch (err) {
@@ -321,11 +379,22 @@ function Conversation(props: {
         </Show>
         <For each={props.messages}>
           {(m) => (
-            <div class="bubble" classList={{ out: m.outgoing, file: !!m.file }}>
+            <div class="bubble" classList={{ out: m.outgoing, file: !!m.file, editing: editing()?.msgId === m.msgId }}>
+              <div class="msg-actions">
+                <Show when={m.outgoing && !m.file}>
+                  <button class="ghost" title={t("edit")} aria-label={t("edit")} onClick={() => startEdit(m)}>
+                    ✏️
+                  </button>
+                </Show>
+                <button class="ghost" title={t("delete")} aria-label={t("delete")} onClick={() => setDeleting(m)}>
+                  🗑️
+                </button>
+              </div>
               <Show when={m.file} fallback={<p>{m.body}</p>}>
-                {(f) => <FileCard file={f()} contactName={name()} />}
+                {(f) => <FileCard file={f()} contactName={name()} onView={setViewer} />}
               </Show>
               <span class="meta">
+                <Show when={m.editedAt}>{`${t("edited")} · `}</Show>
                 {timeFmt.format(new Date(m.sentAt))}
                 <Show when={m.outgoing}>{` · ${t(`status_${m.status}` as Key)}`}</Show>
               </span>
@@ -336,6 +405,65 @@ function Conversation(props: {
       <Show when={dragging()}>
         <div class="drop-overlay">{t("dropHere").replace("{name}", name())}</div>
       </Show>
+      <Show when={props.preparing}>
+        {(p) => (
+          <div class="edit-bar prepare-bar">
+            <span class="prepare-name">
+              {t("preparing")} {p().name}
+            </span>
+            <div class="progress">
+              <div class="bar" style={{ width: `${p().size > 0 ? (p().bytes / p().size) * 100 : 0}%` }} />
+            </div>
+            <span class="muted small">
+              {formatSize(p().bytes)} / {formatSize(p().size)}
+            </span>
+          </div>
+        )}
+      </Show>
+      <Show when={editing()}>
+        <div class="edit-bar">
+          <span>✏️ {t("editing")}</span>
+          <span class="muted small">{t("escToCancel")}</span>
+          <button type="button" class="ghost" onClick={stopEdit} aria-label={t("cancel")}>
+            ✕
+          </button>
+        </div>
+      </Show>
+      <Show when={deleting()}>
+        {(m) => (
+          <Dialog title={t("deleteTitle")} onClose={() => setDeleting(null)}>
+            <p class="muted small delete-preview">{m().file?.name ?? m().body}</p>
+            <Show when={m().outgoing}>
+              <p class="muted small">{t("deleteHint")}</p>
+            </Show>
+            <div class="delete-actions">
+              <Show when={m().outgoing}>
+                <button
+                  class="danger-solid"
+                  onClick={() => {
+                    void api.deleteMessage(props.contact.id, m().msgId, true).catch((err) => setError(errorText(err)));
+                    setDeleting(null);
+                  }}
+                >
+                  {t("deleteForEveryone")}
+                </button>
+              </Show>
+              <button
+                onClick={() => {
+                  void api.deleteMessage(props.contact.id, m().msgId, false).catch((err) => setError(errorText(err)));
+                  setDeleting(null);
+                }}
+              >
+                {t("deleteForMe")}
+              </button>
+              <button class="ghost" onClick={() => setDeleting(null)}>
+                {t("cancel")}
+              </button>
+            </div>
+          </Dialog>
+        )}
+      </Show>
+      <Show when={viewer()}>{(f) => <Lightbox file={f()} onClose={() => setViewer(null)} />}</Show>
       <form class="composer" onSubmit={send}>
         <button
           type="button"
@@ -348,8 +476,10 @@ function Conversation(props: {
           {preparing() ? "…" : "📎"}
         </button>
         <input
+          ref={input}
           value={text()}
           onInput={(e) => setText(e.currentTarget.value)}
+          onKeyDown={onComposerKey}
           placeholder={t("messagePlaceholder")}
           maxLength={16384}
           autofocus
@@ -365,7 +495,51 @@ function Conversation(props: {
   );
 }
 
-function FileCard(props: { file: FileTransfer; contactName: string }) {
+function Lightbox(props: { file: FileTransfer; onClose: () => void }) {
+  const onKey = (e: KeyboardEvent) => e.key === "Escape" && props.onClose();
+  onMount(() => window.addEventListener("keydown", onKey));
+  onCleanup(() => window.removeEventListener("keydown", onKey));
+  return (
+    <div class="lightbox" role="dialog" aria-modal="true" aria-label={props.file.name} onClick={(e) => e.target === e.currentTarget && props.onClose()}>
+      <img src={mediaUrl(props.file.fileId)} alt={props.file.name} />
+      <div class="lightbox-bar">
+        <span class="lightbox-name" title={props.file.name}>
+          {props.file.name} · {formatSize(props.file.size)}
+        </span>
+        <button onClick={() => void api.openFile(props.file.fileId, true).catch(() => {})}>📂 {t("showInFolder")}</button>
+        <button onClick={() => void api.openFile(props.file.fileId, false).catch(() => {})}>{t("open")}</button>
+        <button class="ghost" onClick={props.onClose} aria-label={t("close")}>
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Inline image, video or audio for a file that is complete on disk. */
+function Media(props: { file: FileTransfer; onView: (f: FileTransfer) => void }) {
+  const [broken, setBroken] = createSignal(false);
+  const src = () => mediaUrl(props.file.fileId);
+  return (
+    <Show when={!broken()} fallback={<span class="file-status">{t("mediaUnavailable")}</span>}>
+      <Switch>
+        <Match when={props.file.media === "image"}>
+          <button class="media-thumb" onClick={() => props.onView(props.file)} title={props.file.name}>
+            <img src={src()} alt={props.file.name} loading="lazy" onError={() => setBroken(true)} />
+          </button>
+        </Match>
+        <Match when={props.file.media === "video"}>
+          <video class="media-video" src={src()} controls preload="metadata" onError={() => setBroken(true)} />
+        </Match>
+        <Match when={props.file.media === "audio"}>
+          <audio class="media-audio" src={src()} controls preload="metadata" onError={() => setBroken(true)} />
+        </Match>
+      </Switch>
+    </Show>
+  );
+}
+
+function FileCard(props: { file: FileTransfer; contactName: string; onView: (f: FileTransfer) => void }) {
   const f = () => props.file;
   const pct = () => (f().size > 0 ? Math.min(100, (f().bytes / f().size) * 100) : 100);
   const act = (p: Promise<void>) => void p.catch(() => {});
@@ -395,10 +569,16 @@ function FileCard(props: { file: FileTransfer; contactName: string }) {
       : ["downloading", "waiting", "paused"].includes(file.state);
   };
 
+  const showMedia = () => !!f().media && f().openable && f().state !== "failed";
   return (
     <div class="file-card">
-      <div class="file-head">
-        <span class="file-icon" aria-hidden="true">📄</span>
+      <Show when={showMedia()}>
+        <Media file={f()} onView={props.onView} />
+      </Show>
+      <div class="file-head" classList={{ compact: showMedia() }}>
+        <span class="file-icon" aria-hidden="true">
+          {f().media === "image" ? "🖼️" : f().media === "video" ? "🎬" : f().media === "audio" ? "🎵" : "📄"}
+        </span>
         <div class="file-text">
           <strong class="file-name" title={f().name}>{f().name}</strong>
           <span class="file-size">{formatSize(f().size)}</span>
@@ -429,7 +609,7 @@ function FileCard(props: { file: FileTransfer; contactName: string }) {
           </Show>
         </Show>
         <Show when={f().openable && (f().outgoing || f().state === "complete")}>
-          <Show when={!f().outgoing}>
+          <Show when={!f().outgoing && !f().media}>
             <button class="primary" onClick={() => act(api.openFile(f().fileId, false))}>{t("open")}</button>
           </Show>
           <button class="ghost" onClick={() => act(api.openFile(f().fileId, true))}>{t("showInFolder")}</button>
@@ -772,6 +952,12 @@ function SettingsDialog(props: { server: string | null; onClose: () => void }) {
                 {confirmDelete() ? t("deleteConfirm") : t("deleteAccount")}
               </button>
             </Show>
+
+            <h3 class="muted">{t("downloads")}</h3>
+            <button type="button" onClick={() => attempt(() => api.openDownloadDir())}>
+              📂 {t("openDownloadDir")}
+            </button>
+            <p class="muted small">{t("downloadsHint")}</p>
 
             <h3 class="muted">{t("server")}</h3>
             <div class="row">

@@ -9,6 +9,7 @@
 //!   the app (see [`server`]).
 
 mod dto;
+mod media;
 mod server;
 
 use std::path::PathBuf;
@@ -94,8 +95,8 @@ impl AppState {
         let relays = server.relays;
         let (messenger, mut rx) =
             Messenger::start(storage, server.registry, |cfg| cfg.relays = relays).map_err(err)?;
-        if let Ok(dir) = app.path().download_dir() {
-            messenger.set_download_dir(dir.join("OutpostWave"));
+        if let Some(dir) = download_dir(app) {
+            messenger.set_download_dir(dir);
         }
         let app = app.clone();
         let m = messenger.clone();
@@ -341,6 +342,39 @@ fn file_id(id: &str) -> CmdResult<[u8; 32]> {
     dto::unhex32(id).ok_or_else(|| "invalid file id".to_owned())
 }
 
+fn msg_id(id: &str) -> CmdResult<[u8; 16]> {
+    dto::unhex(id).ok_or_else(|| "invalid message id".to_owned())
+}
+
+/// Edits one of our text messages.
+#[tauri::command]
+async fn edit_message(
+    state: State<'_, AppState>,
+    contact: i64,
+    msg: String,
+    text: String,
+) -> CmdResult<MessageDto> {
+    let m = messenger(&state).await?;
+    let edited = m
+        .edit_message(ContactId(contact), &msg_id(&msg)?, &text)
+        .map_err(err)?;
+    Ok(MessageDto::new(&edited, &m))
+}
+
+/// Deletes a message for us, or for everyone (our own messages).
+#[tauri::command]
+async fn delete_message(
+    state: State<'_, AppState>,
+    contact: i64,
+    msg: String,
+    for_everyone: bool,
+) -> CmdResult<()> {
+    messenger(&state)
+        .await?
+        .delete_message(ContactId(contact), &msg_id(&msg)?, for_everyone)
+        .map_err(err)
+}
+
 /// Offers files to a contact (paths from drag and drop). Files are prepared one after another.
 #[tauri::command]
 async fn send_files(state: State<'_, AppState>, contact: i64, paths: Vec<String>) -> CmdResult<()> {
@@ -399,6 +433,22 @@ async fn cancel_file(state: State<'_, AppState>, file: String) -> CmdResult<()> 
         .await?
         .cancel_file(&file_id(&file)?)
         .map_err(err)
+}
+
+/// Folder where received files are saved.
+fn download_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .download_dir()
+        .ok()
+        .map(|d| d.join("OutpostWave"))
+}
+
+/// Opens the download folder in the file manager (created if needed).
+#[tauri::command]
+fn open_download_dir(app: AppHandle) -> CmdResult<()> {
+    let dir = download_dir(&app).ok_or_else(|| "no download folder".to_owned())?;
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(err)
 }
 
 /// Extensions that can run code when opened: shown in their folder instead of being opened.
@@ -697,6 +747,13 @@ pub fn run() {
     tauri::Builder::default()
         // Native file picker, used from Rust only (no permission granted to the webview).
         .plugin(tauri_plugin_dialog::init())
+        // Images, videos and audio shown in the chat (see `media`).
+        .register_asynchronous_uri_scheme_protocol("owfile", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                responder.respond(media::handle(app, request).await);
+            });
+        })
         .setup(|app| {
             let profile = profile_name();
             let data_dir = app.path().app_data_dir()?.join("profiles").join(&profile);
@@ -751,7 +808,10 @@ pub fn run() {
             download_file,
             pause_file,
             cancel_file,
-            open_file
+            open_file,
+            edit_message,
+            delete_message,
+            open_download_dir
         ])
         .run(tauri::generate_context!())
         .expect("failed to start OutpostWave");

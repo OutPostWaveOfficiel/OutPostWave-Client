@@ -139,6 +139,8 @@ pub struct StoredMessage {
     pub body: String,
     /// Attached file (see [`FileRow`]).
     pub file_id: Option<[u8; 32]>,
+    /// Last edit time (Unix ms), if the message was edited.
+    pub edited_at: Option<i64>,
 }
 
 /// State of a file transfer.

@@ -27,10 +27,15 @@ fn status(s: MessageStatus) -> &'static str {
 
 /// Parses a 32-byte id in hex.
 pub(crate) fn unhex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    unhex(s)
+}
+
+/// Parses an `N`-byte id in hex.
+pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 {
         return None;
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; N];
     for (i, o) in out.iter_mut().enumerate() {
         *o = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
@@ -61,12 +66,15 @@ pub struct FileDto {
     rate: f64,
     /// A local file can be opened (complete download, or our original).
     openable: bool,
+    /// `image`, `video` or `audio` when it can be shown in the chat.
+    media: Option<&'static str>,
 }
 
 impl From<FileInfo> for FileDto {
     fn from(f: FileInfo) -> Self {
         Self {
             file_id: hex(&f.file_id),
+            media: crate::media::media_type(&f.name).map(|(kind, _)| kind),
             name: f.name,
             size: f.size,
             outgoing: f.outgoing,
@@ -132,6 +140,7 @@ pub struct MessageDto {
     status: &'static str,
     body: String,
     file: Option<FileDto>,
+    edited_at: Option<i64>,
 }
 
 impl MessageDto {
@@ -148,6 +157,7 @@ impl MessageDto {
                 .file_id
                 .and_then(|id| messenger.file(&id).ok())
                 .map(FileDto::from),
+            edited_at: m.edited_at,
         }
     }
 }
@@ -162,6 +172,10 @@ impl MessageDto {
 pub enum EventDto {
     /// New message.
     Message { contact: i64, message: MessageDto },
+    /// A message was edited.
+    MessageEdited { contact: i64, message: MessageDto },
+    /// A message was deleted.
+    MessageDeleted { contact: i64, msg_id: String },
     /// Message status change.
     Status {
         contact: i64,
@@ -176,6 +190,13 @@ pub enum EventDto {
     KeyChanged { contact: i64 },
     /// Someone unknown wrote to us.
     ContactRequest { contact: i64 },
+    /// A file is being prepared before it is offered.
+    Preparing {
+        contact: i64,
+        name: String,
+        bytes: u64,
+        size: u64,
+    },
     /// File transfer progress or state change.
     File { contact: i64, file: FileDto },
     /// Events were lost: reload everything.
@@ -189,6 +210,25 @@ impl EventDto {
             MessengerEvent::Message { contact, message } => Self::Message {
                 contact: contact.0,
                 message: MessageDto::new(&message, messenger),
+            },
+            MessengerEvent::MessageEdited { contact, message } => Self::MessageEdited {
+                contact: contact.0,
+                message: MessageDto::new(&message, messenger),
+            },
+            MessengerEvent::MessageDeleted { contact, msg_id } => Self::MessageDeleted {
+                contact: contact.0,
+                msg_id: hex(&msg_id),
+            },
+            MessengerEvent::Preparing {
+                contact,
+                name,
+                bytes,
+                size,
+            } => Self::Preparing {
+                contact: contact.0,
+                name,
+                bytes,
+                size,
             },
             MessengerEvent::File { contact, file } => Self::File {
                 contact: contact.0,

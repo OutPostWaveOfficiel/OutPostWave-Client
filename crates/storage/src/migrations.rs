@@ -77,6 +77,12 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX files_by_state ON files(state);
     ",
+    // v3: edited and deleted messages (deleted rows stay as tombstones: a late duplicate delivery
+    // must not bring them back).
+    r"
+    ALTER TABLE messages ADD COLUMN edited_at INTEGER;
+    ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1));
+    ",
 ];
 
 /// Latest schema version.

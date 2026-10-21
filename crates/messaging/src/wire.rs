@@ -14,6 +14,12 @@
 //!
 //! File offer (kind 3): like text, with `file_id 32 | size u64 BE | file_key 32` before the body,
 //! which holds the file name. See `spec/v0/files.md`.
+//!
+//! Edit (kind 4): `version | kind | msg_id 16 | edited_at i64 BE | body`.
+//!
+//! Delete (kind 5): `version | kind | count u16 BE | msg_id 16 × count`.
+//!
+//! Edits and deletions apply only to messages written by the same contact.
 
 use crate::MessagingError;
 
@@ -21,6 +27,8 @@ const VERSION: u8 = 1;
 const KIND_TEXT: u8 = 1;
 const KIND_RECEIPT: u8 = 2;
 const KIND_FILE: u8 = 3;
+const KIND_EDIT: u8 = 4;
+const KIND_DELETE: u8 = 5;
 /// Maximum number of message ids in one read receipt.
 pub(crate) const MAX_RECEIPT_IDS: usize = 512;
 const FLAG_INTRO: u8 = 1;
@@ -164,12 +172,47 @@ pub(crate) enum Frame {
     Text(TextFrame),
     /// The listed messages were read.
     Receipt(Vec<[u8; 16]>),
+    /// The sender edited one of its messages.
+    Edit {
+        msg_id: [u8; 16],
+        edited_at: i64,
+        body: String,
+    },
+    /// The sender deleted some of its messages.
+    Delete(Vec<[u8; 16]>),
+}
+
+fn ids(rest: &[u8], count: usize) -> Option<Vec<[u8; 16]>> {
+    if count > MAX_RECEIPT_IDS || rest.len() != count * 16 {
+        return None;
+    }
+    Some(
+        rest.chunks_exact(16)
+            .map(|c| c.try_into().unwrap_or([0; 16]))
+            .collect(),
+    )
 }
 
 impl Frame {
+    pub(crate) fn encode_edit(msg_id: &[u8; 16], edited_at: i64, body: &str) -> Vec<u8> {
+        let mut out = vec![VERSION, KIND_EDIT];
+        out.extend_from_slice(msg_id);
+        out.extend_from_slice(&edited_at.to_be_bytes());
+        out.extend_from_slice(body.as_bytes());
+        out
+    }
+
+    pub(crate) fn encode_delete(ids: &[[u8; 16]]) -> Vec<u8> {
+        Self::encode_ids(KIND_DELETE, ids)
+    }
+
     pub(crate) fn encode_receipt(ids: &[[u8; 16]]) -> Vec<u8> {
+        Self::encode_ids(KIND_RECEIPT, ids)
+    }
+
+    fn encode_ids(kind: u8, ids: &[[u8; 16]]) -> Vec<u8> {
         let ids = &ids[..ids.len().min(MAX_RECEIPT_IDS)];
-        let mut out = vec![VERSION, KIND_RECEIPT];
+        let mut out = vec![VERSION, kind];
         out.extend_from_slice(&u16::try_from(ids.len()).unwrap_or(0).to_be_bytes());
         for id in ids {
             out.extend_from_slice(id);
@@ -181,6 +224,25 @@ impl Frame {
         let bad = || MessagingError::Crypto(ow_crypto::CryptoError::Malformed);
         match b {
             [VERSION, KIND_TEXT | KIND_FILE, ..] => TextFrame::decode(b).map(Self::Text),
+            [VERSION, KIND_EDIT, rest @ ..] if rest.len() >= 24 => {
+                let msg_id: [u8; 16] = rest[..16].try_into().map_err(|_| bad())?;
+                let edited_at = i64::from_be_bytes(rest[16..24].try_into().map_err(|_| bad())?);
+                let body = &rest[24..];
+                if body.is_empty() || body.len() > MAX_TEXT_LEN {
+                    return Err(bad());
+                }
+                let body = String::from_utf8(body.to_vec()).map_err(|_| bad())?;
+                Ok(Self::Edit {
+                    msg_id,
+                    edited_at,
+                    body,
+                })
+            }
+            [VERSION, KIND_DELETE, c0, c1, rest @ ..] => {
+                ids(rest, usize::from(u16::from_be_bytes([*c0, *c1])))
+                    .map(Self::Delete)
+                    .ok_or_else(bad)
+            }
             [VERSION, KIND_RECEIPT, c0, c1, rest @ ..] => {
                 let count = usize::from(u16::from_be_bytes([*c0, *c1]));
                 if count > MAX_RECEIPT_IDS || rest.len() != count * 16 {
@@ -204,6 +266,26 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::{FileRef, Frame, Intro, TextFrame};
+
+    #[test]
+    fn edit_delete_roundtrip() {
+        assert_eq!(
+            Frame::decode(&Frame::encode_edit(&[3; 16], 77, "fixed typo")).unwrap(),
+            Frame::Edit {
+                msg_id: [3; 16],
+                edited_at: 77,
+                body: "fixed typo".into()
+            }
+        );
+        assert!(
+            Frame::decode(&Frame::encode_edit(&[3; 16], 77, "")).is_err(),
+            "empty edit"
+        );
+        assert_eq!(
+            Frame::decode(&Frame::encode_delete(&[[1; 16], [2; 16]])).unwrap(),
+            Frame::Delete(vec![[1; 16], [2; 16]])
+        );
+    }
 
     #[test]
     fn receipt_roundtrip() {
