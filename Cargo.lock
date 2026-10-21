@@ -4124,6 +4124,7 @@ dependencies = [
  "ow-storage",
  "qrcode",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tokio",

@@ -119,8 +119,10 @@ async fn chat_and_offline_delivery() {
     .await;
 
     // Bob reads it: Alice sees "read".
+    assert_eq!(bob.contact(contact_alice).unwrap().unread, 1);
     assert_eq!(bob.mark_read(contact_alice).unwrap(), 1);
     assert_eq!(bob.mark_read(contact_alice).unwrap(), 0);
+    assert_eq!(bob.contact(contact_alice).unwrap().unread, 0);
     wait_for(&mut a_rx, |e| {
         matches!(
             e,

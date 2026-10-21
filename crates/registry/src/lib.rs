@@ -31,6 +31,9 @@ pub enum RegistryError {
     InvalidCode,
     /// Too many requests: retry later.
     RateLimited,
+    /// This device is not attached to any account on the registry (identity created offline or
+    /// before the registry existed).
+    UnknownDevice,
     /// The registry rejected the request.
     Rejected(String),
     /// The registry answered with data that does not verify.
@@ -43,6 +46,7 @@ impl core::fmt::Display for RegistryError {
             Self::Unreachable(e) => write!(f, "account server unreachable: {e}"),
             Self::Taken => f.write_str("username already taken"),
             Self::NotFound => f.write_str("user not found"),
+            Self::UnknownDevice => f.write_str("this device has no account on the registry"),
             Self::InvalidCode => f.write_str("invalid or expired code"),
             Self::RateLimited => f.write_str("too many attempts, try again later"),
             Self::Rejected(m) => write!(f, "account server refused: {m}"),
@@ -166,7 +170,9 @@ impl RegistryClient {
             _ => {
                 let v: Value = res.json().await.unwrap_or(Value::Null);
                 let msg = v["message"].as_str().unwrap_or("error").to_owned();
-                Err(if msg.contains("code") {
+                Err(if msg == "unknown device" {
+                    RegistryError::UnknownDevice
+                } else if msg.contains("code") {
                     RegistryError::InvalidCode
                 } else {
                     RegistryError::Rejected(msg)

@@ -5,11 +5,11 @@
 //! Environment (development):
 //! - `OW_PROFILE=<name>`: independent identity per profile (own data folder and database key),
 //!   to test a conversation between two windows on one machine.
-//! - `OW_REGISTRY=<url>|off`: account server. Debug builds default to `http://127.0.0.1:8787`.
-//! - `OW_RELAY=<multiaddr>[,<multiaddr>...]`: relays (with `/p2p/<id>`). Debug builds default to
-//!   the development relay on this machine (`ow-relay --dev`).
+//! - `OW_REGISTRY=<url>|off` and `OW_RELAY=<multiaddr>[,...]`: override the test server chosen in
+//!   the app (see [`server`]).
 
 mod dto;
+mod server;
 
 use std::path::PathBuf;
 
@@ -17,7 +17,6 @@ use dto::{ContactDto, EventDto, InviteDto, MessageDto};
 use ow_messaging::{
     ContactId, MessagingError, Messenger, NewProfile, ProfileSetup, RegistryClient, RegistryError,
 };
-use ow_p2p::Multiaddr;
 use ow_storage::{Storage, keystore};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -30,8 +29,8 @@ const PAGE: u32 = 50;
 struct AppState {
     profile: String,
     data_dir: PathBuf,
-    registry: Option<RegistryClient>,
-    relays: Vec<Multiaddr>,
+    config_dir: PathBuf,
+    server: std::sync::RwLock<server::Server>,
     messenger: Mutex<Option<Messenger>>,
 }
 
@@ -55,6 +54,8 @@ pub struct AppInfo {
     pub profile: String,
     /// An account server is configured (usernames, search, recovery).
     pub registry: bool,
+    /// Test server host chosen in the app or at build time.
+    pub server: Option<String>,
 }
 
 /// Returns build information about the running client.
@@ -65,7 +66,8 @@ fn app_info(state: State<'_, AppState>) -> AppInfo {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         profile: state.profile.clone(),
-        registry: state.registry.is_some(),
+        registry: state.server().registry.is_some(),
+        server: state.server().host,
     }
 }
 
@@ -76,18 +78,22 @@ impl AppState {
         Storage::open(&self.data_dir.join("outpostwave.db"), &key).map_err(err)
     }
 
-    fn registry(&self) -> CmdResult<&RegistryClient> {
-        self.registry
-            .as_ref()
+    fn server(&self) -> server::Server {
+        self.server.read().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    fn registry(&self) -> CmdResult<RegistryClient> {
+        self.server()
+            .registry
             .ok_or_else(|| err(MessagingError::NoRegistry))
     }
 
     /// Starts the messenger on `storage` and forwards its events to the UI.
     fn start(&self, app: &AppHandle, storage: Storage) -> CmdResult<Messenger> {
-        let relays = self.relays.clone();
+        let server = self.server();
+        let relays = server.relays;
         let (messenger, mut rx) =
-            Messenger::start(storage, self.registry.clone(), |cfg| cfg.relays = relays)
-                .map_err(err)?;
+            Messenger::start(storage, server.registry, |cfg| cfg.relays = relays).map_err(err)?;
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -167,7 +173,7 @@ async fn create_identity(
     discoverable: bool,
 ) -> CmdResult<Vec<String>> {
     let mut profile = ProfileSetup::prepare_new(&name, &device_name).map_err(err)?;
-    if let Some(reg) = &state.registry {
+    if let Some(reg) = &state.server().registry {
         let bundle = profile.bundle();
         let email = email.as_deref().map(str::trim).filter(|e| !e.is_empty());
         reg.register(
@@ -195,7 +201,7 @@ async fn restore_identity(
     device_name: String,
 ) -> CmdResult<String> {
     let mut profile = ProfileSetup::prepare_restore(&phrase, &name, &device_name).map_err(err)?;
-    if let Some(reg) = &state.registry {
+    if let Some(reg) = &state.server().registry {
         let bundle = profile.bundle();
         reg.put_device(profile.device(), profile.cert(), &bundle)
             .await
@@ -348,14 +354,32 @@ struct Settings {
     email_verified: Option<bool>,
     #[serde(default)]
     backup_enabled: bool,
+    /// The account server works but this identity has no account there (old profile).
+    #[serde(default)]
+    account_missing: bool,
+    /// Notification sounds.
+    #[serde(default = "yes")]
+    sounds: bool,
+}
+
+const fn yes() -> bool {
+    true
 }
 
 /// Reads the user settings.
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
     let m = messenger(&state).await?;
-    let account = if state.registry.is_some() {
-        m.account().await.ok()
+    let mut account_missing = false;
+    let account = if state.server().registry.is_some() {
+        match m.account().await {
+            Ok(a) => Some(a),
+            Err(MessagingError::Registry(RegistryError::UnknownDevice)) => {
+                account_missing = true;
+                None
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -365,6 +389,8 @@ async fn get_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
         email: account.as_ref().and_then(|a| a.email.clone()),
         email_verified: account.as_ref().map(|a| a.email_verified),
         backup_enabled: m.backup_enabled(),
+        account_missing,
+        sounds: m.pref("sounds", true).map_err(err)?,
     })
 }
 
@@ -373,6 +399,7 @@ async fn get_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
 async fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<()> {
     let m = messenger(&state).await?;
     m.set_read_receipts(settings.read_receipts).map_err(err)?;
+    m.set_pref("sounds", settings.sounds).map_err(err)?;
     if let Some(d) = settings.discoverable {
         m.set_discoverable(d).await.map_err(err)?;
     }
@@ -463,6 +490,94 @@ async fn delete_account(state: State<'_, AppState>) -> CmdResult<()> {
     messenger(&state).await?.delete_account().await.map_err(err)
 }
 
+/// Local UI preferences (no network access, unlike [`get_settings`]).
+#[derive(Debug, Serialize)]
+struct Prefs {
+    sounds: bool,
+}
+
+/// Reads the local UI preferences.
+#[tauri::command]
+async fn get_prefs(state: State<'_, AppState>) -> CmdResult<Prefs> {
+    let m = messenger(&state).await?;
+    Ok(Prefs {
+        sounds: m.pref("sounds", true).map_err(err)?,
+    })
+}
+
+/// Claims the username on the account server for a profile created before it existed.
+#[tauri::command]
+async fn register_account(
+    state: State<'_, AppState>,
+    email: Option<String>,
+    discoverable: bool,
+) -> CmdResult<()> {
+    let email = email.as_deref().map(str::trim).filter(|e| !e.is_empty());
+    messenger(&state)
+        .await?
+        .register_account(email, discoverable)
+        .await
+        .map_err(|e| match e {
+            MessagingError::Registry(r) => registry_err(r),
+            other => err(other),
+        })
+}
+
+/// Unread count on the taskbar icon. On Windows, `overlay` is the 32×32 RGBA badge drawn by the
+/// UI (Windows has no numeric badge API); elsewhere the native badge count is used.
+#[tauri::command]
+fn set_badge(app: AppHandle, count: u32, overlay: Option<Vec<u8>>) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let icon = overlay
+            .filter(|o| count > 0 && o.len() == 32 * 32 * 4)
+            .map(|o| tauri::image::Image::new_owned(o, 32, 32));
+        let _ = w.set_overlay_icon(icon);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = overlay;
+        let _ = w.set_badge_count((count > 0).then_some(i64::from(count)));
+    }
+}
+
+/// Flashes the taskbar entry when the window is not focused.
+#[tauri::command]
+fn request_attention(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        if !w.is_focused().unwrap_or(true) {
+            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
+    }
+}
+
+/// Sets (or clears, with `None`) the test server host, then restarts the app if an identity is
+/// already running.
+#[tauri::command]
+async fn set_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    host: Option<String>,
+) -> CmdResult<()> {
+    let host = host.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+    if let Some(h) = &host {
+        if !server::valid_host(h) {
+            return Err("invalid_host".to_owned());
+        }
+    }
+    server::save_host(&state.config_dir, host.as_deref()).map_err(err)?;
+    if state.messenger.lock().await.is_some() {
+        app.restart();
+    }
+    if let Ok(mut s) = state.server.write() {
+        *s = server::resolve(&state.config_dir);
+    }
+    Ok(())
+}
+
 /// Profile name from `OW_PROFILE`, restricted to `[a-z0-9_-]{1,32}`.
 fn profile_name() -> String {
     std::env::var("OW_PROFILE")
@@ -474,40 +589,6 @@ fn profile_name() -> String {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         })
         .unwrap_or_else(|| "default".to_owned())
-}
-
-/// Account server from `OW_REGISTRY` (debug builds default to a local registry).
-fn registry_client() -> Option<RegistryClient> {
-    let url = match std::env::var("OW_REGISTRY") {
-        Ok(v) if v.eq_ignore_ascii_case("off") => return None,
-        Ok(v) => v,
-        Err(_) if cfg!(debug_assertions) => "http://127.0.0.1:8787".to_owned(),
-        Err(_) => return None,
-    };
-    RegistryClient::new(&url).ok()
-}
-
-/// Relays from `OW_RELAY` (debug builds default to the development relay on this machine).
-fn relays() -> Vec<Multiaddr> {
-    match std::env::var("OW_RELAY") {
-        Ok(v) => v.split(',').filter_map(|a| a.trim().parse().ok()).collect(),
-        Err(_) if cfg!(debug_assertions) => {
-            let key = ow_identity::DeviceKey::from_secret_bytes(&ow_p2p::DEV_RELAY_SEED);
-            ow_p2p::peer_id_of(&key.public_key().to_bytes())
-                .ok()
-                .and_then(|id| {
-                    format!(
-                        "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{id}",
-                        ow_p2p::DEV_RELAY_PORT
-                    )
-                    .parse()
-                    .ok()
-                })
-                .into_iter()
-                .collect()
-        }
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Starts the application.
@@ -526,11 +607,13 @@ pub fn run() {
                     let _ = w.set_title(&format!("OutpostWave — {profile}"));
                 }
             }
+            let config_dir = app.path().app_config_dir()?;
+            let server = std::sync::RwLock::new(server::resolve(&config_dir));
             app.manage(AppState {
                 profile,
                 data_dir,
-                registry: registry_client(),
-                relays: relays(),
+                config_dir,
+                server,
                 messenger: Mutex::new(None),
             });
             Ok(())
@@ -559,7 +642,12 @@ pub fn run() {
             disable_backup,
             restore_backup,
             ack_key_change,
-            delete_account
+            delete_account,
+            register_account,
+            set_badge,
+            request_attention,
+            set_server,
+            get_prefs
         ])
         .run(tauri::generate_context!())
         .expect("failed to start OutpostWave");

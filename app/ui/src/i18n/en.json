@@ -92,5 +92,16 @@
   "deleted": "Account deleted from the server.",
   "err_wrong_password": "Wrong password.",
   "err_password_too_short": "Password too short (10 characters minimum).",
-  "err_no_backup": "No backup found for this account."
+  "err_no_backup": "No backup found for this account.",
+  "sounds": "Notification sounds",
+  "registerTitle": "Claim my username on the server",
+  "registerHint": "This profile was created before the account server. Register your username to be findable, add a recovery email and use encrypted backups.",
+  "register": "Register",
+  "server": "Test server",
+  "serverHint": "IP address or name of the PC running the registry and the relay (e.g. 192.168.1.20).",
+  "serverNone": "none",
+  "apply": "Apply",
+  "change_server": "Change server",
+  "err_invalid_host": "Invalid address.",
+  "restartNote": "The app restarts to apply it."
 }

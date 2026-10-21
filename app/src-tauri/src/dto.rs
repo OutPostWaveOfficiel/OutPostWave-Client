@@ -47,6 +47,7 @@ pub struct ContactDto {
     safety_number: String,
     key_changed: bool,
     name_unconfirmed: bool,
+    unread: u32,
 }
 
 impl From<ContactInfo> for ContactDto {
@@ -60,6 +61,7 @@ impl From<ContactInfo> for ContactDto {
             safety_number: c.safety_number,
             key_changed: c.key_changed,
             name_unconfirmed: c.name_unconfirmed,
+            unread: c.unread,
         }
     }
 }
@@ -111,6 +113,8 @@ pub enum EventDto {
     Presence { contact: i64, online: bool },
     /// A contact's keys changed.
     KeyChanged { contact: i64 },
+    /// Someone unknown wrote to us.
+    ContactRequest { contact: i64 },
     /// Events were lost: reload everything.
     Resync,
 }
@@ -133,6 +137,9 @@ impl From<MessengerEvent> for EventDto {
             },
             MessengerEvent::ContactsChanged => Self::Contacts,
             MessengerEvent::KeyChanged { contact } => Self::KeyChanged { contact: contact.0 },
+            MessengerEvent::ContactRequest { contact } => {
+                Self::ContactRequest { contact: contact.0 }
+            }
             MessengerEvent::Presence { contact, online } => Self::Presence {
                 contact: contact.0,
                 online,

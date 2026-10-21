@@ -249,6 +249,8 @@ pub struct ContactInfo {
     pub key_changed: bool,
     /// The username was announced by the contact but not confirmed by the account server.
     pub name_unconfirmed: bool,
+    /// Unread incoming messages.
+    pub unread: u32,
 }
 
 /// Events for the UI.
@@ -272,6 +274,11 @@ pub enum MessengerEvent {
     },
     /// The contact list changed (added, updated).
     ContactsChanged,
+    /// Someone unknown wrote to us and was added to the contacts.
+    ContactRequest {
+        /// The new contact.
+        contact: ContactId,
+    },
     /// A contact's keys changed (verified with the account server).
     KeyChanged {
         /// Contact.
@@ -719,6 +726,84 @@ impl Messenger {
         Ok(())
     }
 
+    /// Claims our username on the registry for an identity that has no account yet (created
+    /// offline or before the registry existed). If the identity already has an account (created
+    /// from another device), this device is attached to it instead.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Taken`](ow_registry::RegistryError::Taken) if someone else owns the
+    /// name, [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn register_account(&self, email: Option<&str>, discoverable: bool) -> Result<()> {
+        let registry = self.registry()?;
+        let inner = &self.inner;
+        let bundle = lock(&inner.crypto)
+            .account
+            .fallback_bundle(&inner.device, now_s());
+        inner.save_account()?;
+        match registry
+            .register(
+                &inner.device,
+                &inner.cert,
+                &bundle,
+                &inner.handle,
+                email,
+                discoverable,
+            )
+            .await
+        {
+            Err(ow_registry::RegistryError::Taken) => {
+                // Our identity may already own the name (account created from another device).
+                registry
+                    .put_device(&inner.device, &inner.cert, &bundle)
+                    .await
+                    .map_err(|e| match e {
+                        ow_registry::RegistryError::Rejected(_)
+                        | ow_registry::RegistryError::NotFound => ow_registry::RegistryError::Taken,
+                        other => other,
+                    })?;
+                // Attached: the name must be ours, and the email/visibility asked for applied.
+                let me = registry.me(&inner.device).await?;
+                if me.name != inner.handle.name() {
+                    return Err(ow_registry::RegistryError::Taken.into());
+                }
+                if let Some(email) = email {
+                    registry.set_email(&inner.device, Some(email)).await?;
+                }
+                registry
+                    .set_discoverable(&inner.device, discoverable)
+                    .await?;
+                Ok(())
+            }
+            other => Ok(other?),
+        }
+    }
+
+    /// Reads a boolean preference stored with the profile (UI settings).
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn pref(&self, name: &str, default: bool) -> Result<bool> {
+        Ok(lock(&self.inner.storage)
+            .get_secret(&format!("pref:{name}"))?
+            .map_or(default, |v| v.first() == Some(&1)))
+    }
+
+    /// Stores a boolean preference.
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn set_pref(&self, name: &str, value: bool) -> Result<()> {
+        lock(&self.inner.storage).put_secret(
+            &format!("pref:{name}"),
+            &[u8::from(value)],
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
     /// Deletes our account on the registry (username, email, backup). Local data is kept.
     ///
     /// # Errors
@@ -1146,6 +1231,7 @@ impl Inner {
             safety_number: safety,
             key_changed: self.flag(&format!("keychanged:{}", c.id.0)),
             name_unconfirmed: self.flag(&format!("unconfirmed:{}", c.id.0)),
+            unread: lock(&self.storage).unread_count(c.id)?,
         })
     }
 
@@ -1381,7 +1467,9 @@ impl Inner {
                 s.add_contact_device(id, &device, &intro.cert)?;
                 // Announced by the sender: unconfirmed until the account server agrees.
                 s.put_secret(&format!("unconfirmed:{}", id.0), &[1], now_ms())?;
-                let _ = self.events.send(MessengerEvent::ContactsChanged);
+                let _ = self
+                    .events
+                    .send(MessengerEvent::ContactRequest { contact: id });
                 new_from_intro = Some(id);
                 id
             }

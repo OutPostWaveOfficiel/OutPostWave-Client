@@ -278,3 +278,36 @@ async fn backup_key_change_and_impersonation() {
         "real contact untouched"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a running registry (OW_TEST_REGISTRY)"]
+async fn old_profile_registers_and_adds_email() {
+    let relay = start_relay().await;
+    let name = unique("ancien");
+    // Profile created before the registry existed.
+    let storage = Storage::open_in_memory(&DbKey::generate().unwrap()).unwrap();
+    ProfileSetup::create(&storage, &name, "pc").unwrap();
+    let (old, _rx) = start(storage, registry(), &relay);
+    assert!(matches!(
+        old.account().await,
+        Err(MessagingError::Registry(RegistryError::UnknownDevice))
+    ));
+    old.register_account(Some("ancien@example.com"), true)
+        .await
+        .unwrap();
+    let me = old.account().await.unwrap();
+    assert_eq!(me.email.as_deref(), Some("ancien@example.com"));
+    assert!(!me.email_verified);
+    // Idempotent for the owner (attaches the device again).
+    old.register_account(None, false).await.unwrap();
+    assert!(!old.account().await.unwrap().discoverable);
+
+    // Another offline identity cannot take the name.
+    let storage = Storage::open_in_memory(&DbKey::generate().unwrap()).unwrap();
+    ProfileSetup::create(&storage, &name, "pc").unwrap();
+    let (other, _rx2) = start(storage, registry(), &relay);
+    assert!(matches!(
+        other.register_account(None, true).await,
+        Err(MessagingError::Registry(RegistryError::Taken))
+    ));
+}

@@ -500,6 +500,20 @@ impl Storage {
         rows.map(|r| to_array(&r?, "message id")).collect()
     }
 
+    /// Number of unread incoming messages from a contact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn unread_count(&self, contact: ContactId) -> Result<u32> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE c.contact_id = ?1 AND m.outgoing = 0 AND m.status = 4",
+            [contact.0],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Updates the status of a message. Statuses only move forward (never back from
     /// `Read` to `Delivered`, for instance).
     ///

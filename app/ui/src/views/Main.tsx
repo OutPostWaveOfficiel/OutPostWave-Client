@@ -3,12 +3,15 @@ import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid
 import { createStore, produce } from "solid-js/store";
 import { api, errorText, type Contact, type Invite, type Message, type Settings } from "../api";
 import { Dialog } from "../components/Dialog";
+import { chime, setBadge } from "../notify";
 import { locale, t, type Key } from "../i18n";
 
 const timeFmt = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" });
 
-export function Main(props: { handle: string }) {
+export function Main(props: { handle: string; os: string; server: string | null }) {
   const [contacts, setContacts] = createSignal<Contact[]>([]);
+  const [sounds, setSounds] = createSignal(true);
+  const loadPrefs = () => api.getPrefs().then((p) => setSounds(p.sounds)).catch(() => {});
   const [selected, setSelected] = createSignal<number | null>(null);
   // Messages per contact, oldest first.
   const [messages, setMessages] = createStore<Record<number, Message[]>>({});
@@ -32,16 +35,32 @@ export function Main(props: { handle: string }) {
     setMessages(contact, (cur) => [...older.reverse(), ...cur]);
   }
 
+  const setUnread = (id: number, f: (n: number) => number) =>
+    setContacts((list) => list.map((c) => (c.id === id ? { ...c, unread: f(c.unread) } : c)));
+
   // Read receipts: the open conversation is "read" while the window has focus.
   function markReadIfVisible() {
     const id = selected();
-    if (id !== null && document.hasFocus()) void api.markRead(id);
+    if (id !== null && document.hasFocus()) {
+      setUnread(id, () => 0);
+      void api.markRead(id);
+    }
+  }
+
+  // Taskbar badge: total unread messages (no badge at 0).
+  createEffect(() => setBadge(contacts().reduce((n, c) => n + c.unread, 0), props.os));
+  onCleanup(() => setBadge(0, props.os));
+
+  function notify(kind: "message" | "activity") {
+    if (sounds()) chime(kind);
+    void api.requestAttention().catch(() => {});
   }
 
   onMount(async () => {
     window.addEventListener("focus", markReadIfVisible);
     onCleanup(() => window.removeEventListener("focus", markReadIfVisible));
     await loadContacts();
+    void loadPrefs();
     const unlisten = await api.onEvent((e) => {
       switch (e.type) {
         case "message":
@@ -50,7 +69,15 @@ export function Main(props: { handle: string }) {
               if (!list.some((m) => m.msgId === e.message.msgId)) list.push(e.message);
             }));
           }
-          if (!e.message.outgoing && e.contact === selected()) markReadIfVisible();
+          if (!e.message.outgoing) {
+            if (e.contact === selected() && document.hasFocus()) {
+              markReadIfVisible();
+            } else {
+              if (contacts().some((c) => c.id === e.contact)) setUnread(e.contact, (n) => n + 1);
+              else void loadContacts();
+              notify("message");
+            }
+          }
           break;
         case "status":
           setMessages(e.contact, (m) => m.msgId === e.msgId, "status", e.status);
@@ -59,8 +86,12 @@ export function Main(props: { handle: string }) {
           setContacts((list) => list.map((c) => (c.id === e.contact ? { ...c, online: e.online } : c)));
           break;
         case "contacts":
+        case "contactRequest":
+          void loadContacts();
+          break;
         case "keyChanged":
           void loadContacts();
+          notify("activity");
           break;
         case "resync":
           void loadContacts();
@@ -107,6 +138,9 @@ export function Main(props: { handle: string }) {
                     <Show when={c.keyChanged || c.nameUnconfirmed}>
                       <span class="alert" title={c.keyChanged ? t("keyChangedBanner").replace("{name}", c.handle) : t("nameUnconfirmedBanner")}>⚠</span>
                     </Show>
+                    <Show when={c.unread > 0}>
+                      <span class="unread" aria-label={`${c.unread}`}>{c.unread > 99 ? "99+" : c.unread}</span>
+                    </Show>
                   </button>
                 </li>
               )}
@@ -146,7 +180,13 @@ export function Main(props: { handle: string }) {
         />
       </Show>
       <Show when={dialog() === "settings"}>
-        <SettingsDialog onClose={() => setDialog(null)} />
+        <SettingsDialog
+          server={props.server}
+          onClose={() => {
+            setDialog(null);
+            void loadPrefs();
+          }}
+        />
       </Show>
       <Show when={dialog() === "safety" && current()}>
         {(c) => (
@@ -359,8 +399,11 @@ function SafetyDialog(props: { contact: Contact; onClose: () => void; onChanged:
   );
 }
 
-function SettingsDialog(props: { onClose: () => void }) {
+function SettingsDialog(props: { server: string | null; onClose: () => void }) {
   const [settings, setSettings] = createSignal<Settings | null>(null);
+  const [regEmail, setRegEmail] = createSignal("");
+  const [regDiscoverable, setRegDiscoverable] = createSignal(true);
+  const [host, setHost] = createSignal(props.server ?? "");
   const [email, setEmail] = createSignal("");
   const [code, setCode] = createSignal("");
   const [codeSent, setCodeSent] = createSignal(false);
@@ -403,8 +446,54 @@ function SettingsDialog(props: { onClose: () => void }) {
             </label>
             <p class="muted small">{t("readReceiptsHint")}</p>
 
+            <label class="check">
+              <input
+                type="checkbox"
+                checked={s().sounds}
+                onChange={(e) => setSettings({ ...s(), sounds: e.currentTarget.checked })}
+              />
+              {t("sounds")}
+            </label>
+
             <h3 class="muted">{t("account")}</h3>
-            <Show when={s().discoverable !== null} fallback={<p class="muted small">{t("registryOff")}</p>}>
+            <Show when={s().accountMissing}>
+              <p class="small">
+                <strong>{t("registerTitle")}</strong>
+              </p>
+              <p class="muted small">{t("registerHint")}</p>
+              <label>
+                {t("email")}
+                <input type="email" value={regEmail()} onInput={(e) => setRegEmail(e.currentTarget.value)} autocomplete="email" />
+              </label>
+              <label class="check">
+                <input type="checkbox" checked={regDiscoverable()} onChange={(e) => setRegDiscoverable(e.currentTarget.checked)} />
+                {t("discoverable")}
+              </label>
+              <button
+                type="button"
+                disabled={busy()}
+                onClick={() => attempt(async () => {
+                  setBusy(true);
+                  try {
+                    await api.registerAccount(regEmail().trim() || null, regDiscoverable());
+                  } finally {
+                    setBusy(false);
+                  }
+                  setCodeSent(regEmail().trim() !== "");
+                  await load();
+                })}
+              >
+                {t("register")}
+              </button>
+            </Show>
+            <Show
+              when={s().discoverable !== null}
+              fallback={
+                <Show when={!s().accountMissing}>
+                  <p class="muted small">{t("registryOff")}</p>
+                </Show>
+              }
+            >
               <label class="check">
                 <input
                   type="checkbox"
@@ -531,6 +620,21 @@ function SettingsDialog(props: { onClose: () => void }) {
                 {confirmDelete() ? t("deleteConfirm") : t("deleteAccount")}
               </button>
             </Show>
+
+            <h3 class="muted">{t("server")}</h3>
+            <div class="row">
+              <input value={host()} onInput={(e) => setHost(e.currentTarget.value)} placeholder="192.168.1.20" />
+              <button
+                type="button"
+                disabled={host().trim() === (props.server ?? "")}
+                onClick={() => attempt(() => api.setServer(host().trim() || null))}
+              >
+                {t("apply")}
+              </button>
+            </div>
+            <p class="muted small">
+              {t("serverHint")} {t("restartNote")}
+            </p>
 
             <Show when={info()}>
               <p class="small ok">{info()}</p>

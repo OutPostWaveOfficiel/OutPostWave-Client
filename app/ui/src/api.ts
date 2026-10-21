@@ -8,6 +8,7 @@ export interface AppInfo {
   arch: string;
   profile: string;
   registry: boolean;
+  server: string | null;
 }
 
 export interface Contact {
@@ -19,6 +20,7 @@ export interface Contact {
   safetyNumber: string;
   keyChanged: boolean;
   nameUnconfirmed: boolean;
+  unread: number;
 }
 
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "received";
@@ -38,6 +40,8 @@ export interface Settings {
   email: string | null;
   emailVerified: boolean | null;
   backupEnabled: boolean;
+  accountMissing: boolean;
+  sounds: boolean;
 }
 
 export interface Invite {
@@ -52,6 +56,7 @@ export type OwEvent =
   | { type: "contacts" }
   | { type: "presence"; contact: number; online: boolean }
   | { type: "keyChanged"; contact: number }
+  | { type: "contactRequest"; contact: number }
   | { type: "resync" };
 
 export const api = {
@@ -73,6 +78,12 @@ export const api = {
   restoreBackup: (password: string) => invoke<number>("restore_backup", { password }),
   ackKeyChange: (contact: number) => invoke<void>("ack_key_change", { contact }),
   deleteAccount: () => invoke<void>("delete_account"),
+  registerAccount: (email: string | null, discoverable: boolean) =>
+    invoke<void>("register_account", { email, discoverable }),
+  setBadge: (count: number, overlay: number[] | null) => invoke<void>("set_badge", { count, overlay }),
+  requestAttention: () => invoke<void>("request_attention"),
+  setServer: (host: string | null) => invoke<void>("set_server", { host }),
+  getPrefs: () => invoke<{ sounds: boolean }>("get_prefs"),
   setEmail: (email: string) => invoke<void>("set_email", { email }),
   verifyEmail: (code: string) => invoke<void>("verify_email", { code }),
   listContacts: () => invoke<Contact[]>("list_contacts"),
@@ -99,6 +110,7 @@ const KNOWN_ERRORS = [
   "wrong_password",
   "password_too_short",
   "no_backup",
+  "invalid_host",
 ] as const;
 
 /** Error message from a rejected command (translated when known). */

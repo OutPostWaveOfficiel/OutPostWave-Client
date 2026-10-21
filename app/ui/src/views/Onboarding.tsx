@@ -5,7 +5,15 @@ import { t } from "../i18n";
 
 type Mode = "create" | "restore" | "recover";
 
-export function Onboarding(props: { defaultDevice: string; registry: boolean; onDone: () => void }) {
+export function Onboarding(props: {
+  defaultDevice: string;
+  registry: boolean;
+  server: string | null;
+  onServerChanged: () => void;
+  onDone: () => void;
+}) {
+  const [editServer, setEditServer] = createSignal(false);
+  const [host, setHost] = createSignal(props.server ?? "");
   const [mode, setMode] = createSignal<Mode>("create");
   const [name, setName] = createSignal("");
   const [device, setDevice] = createSignal(props.defaultDevice);
@@ -200,6 +208,34 @@ export function Onboarding(props: { defaultDevice: string; registry: boolean; on
                 {t("recover")}
               </button>
             </Show>
+            <div class="server-line muted small">
+              <Show
+                when={editServer()}
+                fallback={
+                  <>
+                    {t("server")} : {props.server ?? t("serverNone")}{" · "}
+                    <button type="button" class="ghost inline" onClick={() => setEditServer(true)}>
+                      {t("change_server")}
+                    </button>
+                  </>
+                }
+              >
+                <div class="row">
+                  <input value={host()} onInput={(e) => setHost(e.currentTarget.value)} placeholder="192.168.1.20" />
+                  <button
+                    type="button"
+                    onClick={() => void run(async () => {
+                      await api.setServer(host().trim() || null);
+                      setEditServer(false);
+                      props.onServerChanged();
+                    })}
+                  >
+                    {t("apply")}
+                  </button>
+                </div>
+                <small>{t("serverHint")}</small>
+              </Show>
+            </div>
           </form>
           </Show>
         }

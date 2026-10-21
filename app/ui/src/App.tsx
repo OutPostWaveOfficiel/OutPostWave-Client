@@ -15,7 +15,7 @@ const OS_NAMES: Record<string, string> = {
 
 export function App() {
   document.documentElement.lang = navigator.language.toLowerCase().startsWith("fr") ? "fr" : "en";
-  const [info] = createResource(() => api.appInfo().catch(() => null));
+  const [info, { refetch: refetchInfo }] = createResource(() => api.appInfo().catch(() => null));
   const [handle, { refetch }] = createResource(() => api.identityStatus().catch(() => undefined));
 
   return (
@@ -27,10 +27,14 @@ export function App() {
         <Onboarding
           defaultDevice={OS_NAMES[info()?.os ?? ""] ?? "PC"}
           registry={info()?.registry ?? false}
+          server={info()?.server ?? null}
+          onServerChanged={() => void refetchInfo()}
           onDone={() => void refetch()}
         />
       </Match>
-      <Match when={handle()}>{(h) => <Main handle={h()} />}</Match>
+      <Match when={handle()}>
+        {(h) => <Main handle={h()} os={info()?.os ?? ""} server={info()?.server ?? null} />}
+      </Match>
     </Switch>
   );
 }

@@ -92,5 +92,16 @@
   "deleted": "Compte supprimé du serveur.",
   "err_wrong_password": "Mot de passe incorrect.",
   "err_password_too_short": "Mot de passe trop court (10 caractères minimum).",
-  "err_no_backup": "Aucune sauvegarde trouvée pour ce compte."
+  "err_no_backup": "Aucune sauvegarde trouvée pour ce compte.",
+  "sounds": "Sons de notification",
+  "registerTitle": "Enregistrer mon pseudo sur le serveur",
+  "registerHint": "Ce profil a été créé avant le serveur de comptes. Enregistrez votre pseudo pour être trouvable, ajouter un email de récupération et utiliser la sauvegarde chiffrée.",
+  "register": "Enregistrer",
+  "server": "Serveur de test",
+  "serverHint": "Adresse IP ou nom du PC qui fait tourner le registre et le relais (ex. 192.168.1.20).",
+  "serverNone": "aucun",
+  "apply": "Appliquer",
+  "change_server": "Changer de serveur",
+  "err_invalid_host": "Adresse invalide.",
+  "restartNote": "L'app redémarre pour l'appliquer."
 }
