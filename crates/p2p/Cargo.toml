@@ -13,4 +13,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+futures = "0.3"
+libp2p = { version = "0.57", features = [
+    "tokio", "quic", "tcp", "noise", "yamux", "dns", "ed25519",
+    "identify", "ping", "mdns", "kad", "relay", "dcutr", "request-response", "macros",
+] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+zeroize = { version = "1.9", features = ["derive"] }
 
+# QUIC (rustls) uses aws-lc-rs. On Windows x86/x64 its assembly needs NASM: use the prebuilt NASM
+# objects shipped by AWS in the crate instead, so developers do not need to install NASM.
+# Set AWS_LC_SYS_PREBUILT_NASM=0 and install NASM to build them from source.
+[target.'cfg(windows)'.dependencies]
+aws-lc-sys = { version = "0.46", features = ["prebuilt-nasm"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+ed25519-dalek = "3"
