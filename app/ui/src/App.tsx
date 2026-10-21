@@ -1,37 +1,32 @@
-// Root component.
-import { createResource, Show } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
-import { detectLocale, t } from "./i18n";
+// Root component: onboarding until an identity exists, then the main screen.
+import { createResource, Match, Switch } from "solid-js";
+import { api } from "./api";
+import { t } from "./i18n";
+import { Main } from "./views/Main";
+import { Onboarding } from "./views/Onboarding";
 
-interface AppInfo {
-  version: string;
-  os: string;
-  arch: string;
-}
-
-/** Fetches build info from the Rust backend; `null` when running in a plain browser. */
-async function fetchAppInfo(): Promise<AppInfo | null> {
-  try {
-    return await invoke<AppInfo>("app_info");
-  } catch {
-    return null;
-  }
-}
+const OS_NAMES: Record<string, string> = {
+  windows: "PC Windows",
+  macos: "Mac",
+  linux: "PC Linux",
+  android: "Android",
+  ios: "iPhone",
+};
 
 export function App() {
-  const locale = detectLocale();
-  document.documentElement.lang = locale;
-  const [info] = createResource(fetchAppInfo);
+  document.documentElement.lang = navigator.language.toLowerCase().startsWith("fr") ? "fr" : "en";
+  const [info] = createResource(() => api.appInfo().catch(() => null));
+  const [handle, { refetch }] = createResource(() => api.identityStatus().catch(() => undefined));
 
   return (
-    <>
-      <h1>OutpostWave</h1>
-      <p>{t(locale, "tagline")}</p>
-      <Show when={!info.loading}>
-        <p class="muted">
-          {info() ? `v${info()!.version} · ${info()!.os} / ${info()!.arch}` : t(locale, "noBackend")}
-        </p>
-      </Show>
-    </>
+    <Switch fallback={<div class="center-screen muted">{t("loading")}</div>}>
+      <Match when={handle() === undefined && !handle.loading}>
+        <div class="center-screen muted">{t("noBackend")}</div>
+      </Match>
+      <Match when={handle() === null}>
+        <Onboarding defaultDevice={OS_NAMES[info()?.os ?? ""] ?? "PC"} onDone={() => void refetch()} />
+      </Match>
+      <Match when={handle()}>{(h) => <Main handle={h()} />}</Match>
+    </Switch>
   );
 }

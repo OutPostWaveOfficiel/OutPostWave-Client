@@ -4076,10 +4076,13 @@ version = "0.0.1"
 name = "ow-app"
 version = "0.0.1"
 dependencies = [
- "ow-identity",
+ "ow-messaging",
+ "ow-storage",
+ "qrcode",
  "serde",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]
@@ -4110,6 +4113,17 @@ dependencies = [
 [[package]]
 name = "ow-messaging"
 version = "0.0.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "ow-crypto",
+ "ow-identity",
+ "ow-p2p",
+ "ow-storage",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
 
 [[package]]
 name = "ow-mumblelink"
@@ -4579,6 +4593,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

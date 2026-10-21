@@ -25,6 +25,13 @@ npm install
 npm run tauri dev
 ```
 
+## Tester une conversation sur un seul PC
+
+Chaque profil est une identité indépendante (dossier de données et clé de base séparés) :
+`run.cmd` option 1, puis dans une autre fenêtre `run.cmd` option 2 (profil `test2`).
+Créez un compte dans chaque fenêtre, copiez le code d'invitation de l'une (« Mon code ») dans
+l'autre (« Ajouter un contact »), puis discutez. Deux PC du même réseau local se trouvent seuls.
+
 ## Licence
 
 [GPL-3.0](LICENSE) : les forks du client restent libres.

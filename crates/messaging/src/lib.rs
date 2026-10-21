@@ -1,14 +1,29 @@
-//! Direct messages and groups: sync and store-and-forward.
+//! Direct messaging: glues identity, encrypted storage, end-to-end encryption and P2P transport.
 //!
-//! Status: skeleton (PoC roadmap step 0). The implementation will land in later steps.
+//! Flow of a message:
+//!
+//! ```text
+//! text ─▶ frame (wire.rs) ─▶ Olm envelope (ow-crypto) ─▶ /outpostwave/dm/1 (ow-p2p) ─▶ peer
+//!                                                                     ◀── "ok" acknowledgement
+//! ```
+//!
+//! Contacts are added with an **invite code** (`OW1:…`, also shown as a QR code) carrying the
+//! handle, master key, device certificate, a signed prekey bundle and network addresses. The
+//! first messages to a new contact carry an *introduction* (handle + device certificate) so the
+//! receiver can add the sender back.
+//!
+//! Messages to an offline contact stay `Pending` and are re-sent when the contact's device comes
+//! online (discovered or connected).
 
-/// Name of this crate, exposed for diagnostics and logs.
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+mod base32;
+mod error;
+mod invite;
+mod messenger;
+mod wire;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_is_set() {
-        assert!(super::CRATE_NAME.starts_with("ow-"));
-    }
-}
+pub use error::MessagingError;
+pub use invite::Invite;
+pub use messenger::{ContactInfo, Messenger, MessengerEvent, ProfileSetup};
+pub use ow_identity::RecoveryPhrase;
+pub use ow_storage::{ContactId, MessageStatus, StoredMessage};
+pub use wire::MAX_TEXT_LEN;

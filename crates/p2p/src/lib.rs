@@ -22,7 +22,7 @@ mod node;
 
 pub use config::P2pConfig;
 pub use error::P2pError;
-pub use libp2p::{Multiaddr, PeerId};
+pub use libp2p::{Multiaddr, PeerId, multiaddr};
 pub use node::{P2pEvent, P2pHandle, ReplyToken, device_key_of, peer_id_of, start};
 
 /// Maximum size of a direct-message payload (encrypted envelope), in bytes.

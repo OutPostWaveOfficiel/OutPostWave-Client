@@ -28,6 +28,19 @@ npm run tauri dev               # run the desktop app
 npm run tauri build             # release bundle
 ```
 
+## Test a conversation on one PC
+
+Each profile is an independent identity (own data folder and database key):
+
+```sh
+cd app && npm run tauri dev              # profile "default"
+# in another terminal, from the repository root:
+OW_PROFILE=test2 target/debug/ow-app     # Windows: set OW_PROFILE=test2 && target\debug\ow-app.exe
+```
+
+Create an account in each window, copy the invite code of one ("My code") into the other
+("Add a contact"), then chat. Two PCs on the same local network find each other automatically.
+
 ## Layout
 
 | Path | Content |

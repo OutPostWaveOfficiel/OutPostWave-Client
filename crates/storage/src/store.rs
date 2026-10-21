@@ -271,6 +271,41 @@ impl Storage {
         rows.map(|r| to_array(&r?, "device key")).collect()
     }
 
+    /// Finds the contact owning a device key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn contact_by_device(&self, device_pub: &[u8; 32]) -> Result<Option<Contact>> {
+        self.conn
+            .query_row(
+                "SELECT c.id, c.master_pub, c.handle, c.display_name, c.verified, c.added_at
+                 FROM contacts c JOIN contact_devices d ON d.contact_id = c.id
+                 WHERE d.device_pub = ?1",
+                [&device_pub[..]],
+                contact_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Finds a contact by row id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn contact(&self, id: ContactId) -> Result<Option<Contact>> {
+        self.conn
+            .query_row(
+                "SELECT id, master_pub, handle, display_name, verified, added_at
+                 FROM contacts WHERE id = ?1",
+                [id.0],
+                contact_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     // --- conversations and messages -------------------------------------------------------
 
     /// Returns the direct-message conversation with `contact`, creating it if needed.
@@ -343,6 +378,23 @@ impl Storage {
             params![conversation.0, before.unwrap_or(i64::MAX), limit],
             message_from_row,
         )?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Outgoing messages of a conversation not yet delivered, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn undelivered(&self, conversation: ConversationId) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
+                    status, body
+             FROM messages
+             WHERE conversation_id = ?1 AND outgoing = 1 AND status < 2
+             ORDER BY sent_at, id",
+        )?;
+        let rows = stmt.query_map([conversation.0], message_from_row)?;
         rows.map(|r| r?).collect()
     }
 
@@ -583,6 +635,14 @@ mod tests {
         assert_eq!(
             s.messages(conv, None, 1).unwrap()[0].status,
             MessageStatus::Read
+        );
+
+        assert_eq!(s.contact_by_device(&[2; 32]).unwrap().unwrap().id, c);
+        assert_eq!(s.contact(c).unwrap().unwrap().master_pub, [1; 32]);
+        assert_eq!(
+            s.undelivered(conv).unwrap().len(),
+            4,
+            "msg 4 is read, others pending"
         );
 
         s.delete_contact(c).unwrap();

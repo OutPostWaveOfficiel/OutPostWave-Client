@@ -13,4 +13,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+getrandom = "0.4"
+ow-crypto = { path = "../crypto" }
+ow-identity = { path = "../identity" }
+ow-p2p = { path = "../p2p" }
+ow-storage = { path = "../storage" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+zeroize = "1.9"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
