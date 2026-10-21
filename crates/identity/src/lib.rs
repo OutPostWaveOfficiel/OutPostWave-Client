@@ -1,14 +1,26 @@
-//! Identity: Ed25519 keys, recovery phrase, multi-device.
+//! OutpostWave identity.
 //!
-//! Status: skeleton (PoC roadmap step 0). The implementation will land in later steps.
+//! - A **master key** (Ed25519) is derived from a 24-word **recovery phrase** (BIP-39).
+//!   Its private part never leaves the user's devices.
+//! - Each **device** has its own random Ed25519 key, certified by the master key
+//!   ([`DeviceCertificate`]). Device keys are what peers see on the network.
+//! - A **handle** `name#tag` pairs a unique name (enforced by the registry) with a 4-character
+//!   tag derived from the master public key, for quick visual checks.
+//! - **Safety numbers** let two contacts verify each other's keys out of band.
 
-/// Name of this crate, exposed for diagnostics and logs.
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+mod base32;
+mod device;
+mod error;
+mod handle;
+mod keys;
+mod master;
+mod phrase;
+mod safety;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_is_set() {
-        assert!(super::CRATE_NAME.starts_with("ow-"));
-    }
-}
+pub use device::{DeviceCertificate, DeviceKey, MAX_DEVICE_NAME_LEN};
+pub use error::IdentityError;
+pub use handle::{Handle, MAX_NAME_LEN, MIN_NAME_LEN, TAG_LEN};
+pub use keys::{Fingerprint, PublicKey};
+pub use master::MasterKey;
+pub use phrase::{RecoveryPhrase, WORD_COUNT};
+pub use safety::safety_number;

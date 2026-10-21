@@ -13,4 +13,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-
+bip39 = { version = "3", features = ["zeroize"] }
+blake3 = "1.8"
+ed25519-dalek = "3"
+getrandom = "0.4"
+zeroize = "1.9"
