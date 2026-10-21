@@ -16,6 +16,7 @@ for Windows, macOS, Linux, Android and iOS (x86_64 and ARM64).
 - [Rust](https://rustup.rs) (the exact version is pinned in `rust-toolchain.toml`)
 - [Node.js](https://nodejs.org) 20+
 - Tauri system dependencies: <https://v2.tauri.app/start/prerequisites/>
+- **Windows only**: [Strawberry Perl](https://strawberryperl.com) (`winget install StrawberryPerl.StrawberryPerl`), needed to build the OpenSSL bundled with SQLCipher. NASM is optional.
 
 ## Develop
 

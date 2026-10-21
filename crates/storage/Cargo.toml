@@ -12,5 +12,19 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
+[features]
+default = []
+# Store the database key in the OS credential store (Windows Credential Manager,
+# macOS/iOS Keychain, Linux Secret Service).
+os-keystore = ["dep:keyring"]
 
+[dependencies]
+# SQLCipher with a vendored OpenSSL: identical encryption on every OS, no system library needed.
+# Building OpenSSL requires Perl (on Windows: Strawberry Perl). NASM is optional.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+getrandom = "0.4"
+zeroize = { version = "1.9", features = ["derive"] }
+keyring = { version = "4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
