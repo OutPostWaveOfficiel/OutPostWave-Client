@@ -40,7 +40,7 @@ pub struct ConversationId(pub i64);
 pub struct NewContact {
     /// Master public key.
     pub master_pub: [u8; 32],
-    /// Full handle `name#tag`.
+    /// Username.
     pub handle: String,
     /// Optional local nickname.
     pub display_name: Option<String>,
@@ -55,7 +55,7 @@ pub struct Contact {
     pub id: ContactId,
     /// Master public key.
     pub master_pub: [u8; 32],
-    /// Full handle `name#tag`.
+    /// Username.
     pub handle: String,
     /// Optional local nickname.
     pub display_name: Option<String>,
@@ -74,7 +74,7 @@ pub enum MessageStatus {
     Sent = 1,
     /// Acknowledged by the recipient's device.
     Delivered = 2,
-    /// Read by the recipient.
+    /// Read by the recipient (outgoing) or by the user (incoming).
     Read = 3,
     /// Incoming message.
     Received = 4,

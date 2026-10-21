@@ -1,7 +1,7 @@
 // Main screen: contact list + conversation.
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import { api, errorText, type Contact, type Invite, type Message } from "../api";
+import { api, errorText, type Contact, type Invite, type Message, type Settings } from "../api";
 import { Dialog } from "../components/Dialog";
 import { locale, t, type Key } from "../i18n";
 
@@ -12,7 +12,7 @@ export function Main(props: { handle: string }) {
   const [selected, setSelected] = createSignal<number | null>(null);
   // Messages per contact, oldest first.
   const [messages, setMessages] = createStore<Record<number, Message[]>>({});
-  const [dialog, setDialog] = createSignal<"invite" | "add" | "safety" | null>(null);
+  const [dialog, setDialog] = createSignal<"invite" | "add" | "safety" | "settings" | null>(null);
 
   const current = () => contacts().find((c) => c.id === selected()) ?? null;
 
@@ -32,7 +32,15 @@ export function Main(props: { handle: string }) {
     setMessages(contact, (cur) => [...older.reverse(), ...cur]);
   }
 
+  // Read receipts: the open conversation is "read" while the window has focus.
+  function markReadIfVisible() {
+    const id = selected();
+    if (id !== null && document.hasFocus()) void api.markRead(id);
+  }
+
   onMount(async () => {
+    window.addEventListener("focus", markReadIfVisible);
+    onCleanup(() => window.removeEventListener("focus", markReadIfVisible));
     await loadContacts();
     const unlisten = await api.onEvent((e) => {
       switch (e.type) {
@@ -42,6 +50,7 @@ export function Main(props: { handle: string }) {
               if (!list.some((m) => m.msgId === e.message.msgId)) list.push(e.message);
             }));
           }
+          if (!e.message.outgoing && e.contact === selected()) markReadIfVisible();
           break;
         case "status":
           setMessages(e.contact, (m) => m.msgId === e.msgId, "status", e.status);
@@ -50,6 +59,7 @@ export function Main(props: { handle: string }) {
           setContacts((list) => list.map((c) => (c.id === e.contact ? { ...c, online: e.online } : c)));
           break;
         case "contacts":
+        case "keyChanged":
           void loadContacts();
           break;
         case "resync":
@@ -64,6 +74,7 @@ export function Main(props: { handle: string }) {
   createEffect(() => {
     const id = selected();
     if (id !== null && !messages[id]) void loadMessages(id);
+    markReadIfVisible();
   });
 
   return (
@@ -71,6 +82,9 @@ export function Main(props: { handle: string }) {
       <aside class="sidebar">
         <div class="me">
           <strong>{props.handle}</strong>
+          <button class="ghost" onClick={() => setDialog("settings")} title={t("settings")} aria-label={t("settings")}>
+            ⚙
+          </button>
         </div>
         <div class="actions">
           <button onClick={() => setDialog("invite")}>{t("myCode")}</button>
@@ -90,6 +104,9 @@ export function Main(props: { handle: string }) {
                     <Show when={c.verified}>
                       <span class="badge" title={t("verified")}>✓</span>
                     </Show>
+                    <Show when={c.keyChanged || c.nameUnconfirmed}>
+                      <span class="alert" title={c.keyChanged ? t("keyChangedBanner").replace("{name}", c.handle) : t("nameUnconfirmedBanner")}>⚠</span>
+                    </Show>
                   </button>
                 </li>
               )}
@@ -106,6 +123,10 @@ export function Main(props: { handle: string }) {
               messages={messages[c().id] ?? []}
               onOlder={() => loadOlder(c().id)}
               onSafety={() => setDialog("safety")}
+              onAck={async () => {
+                await api.ackKeyChange(c().id);
+                void loadContacts();
+              }}
             />
           )}
         </Show>
@@ -123,6 +144,9 @@ export function Main(props: { handle: string }) {
             setDialog(null);
           }}
         />
+      </Show>
+      <Show when={dialog() === "settings"}>
+        <SettingsDialog onClose={() => setDialog(null)} />
       </Show>
       <Show when={dialog() === "safety" && current()}>
         {(c) => (
@@ -142,6 +166,7 @@ function Conversation(props: {
   messages: Message[];
   onOlder: () => void;
   onSafety: () => void;
+  onAck: () => void;
 }) {
   const [text, setText] = createSignal("");
   const [error, setError] = createSignal("");
@@ -176,6 +201,18 @@ function Conversation(props: {
           {t("safetyNumber")}
         </button>
       </header>
+      <Show when={props.contact.keyChanged}>
+        <div class="banner">
+          <span>{t("keyChangedBanner").replace("{name}", props.contact.handle)}</span>
+          <button onClick={props.onSafety}>{t("check")}</button>
+          <button class="ghost" onClick={props.onAck}>{t("ok")}</button>
+        </div>
+      </Show>
+      <Show when={props.contact.nameUnconfirmed}>
+        <div class="banner">
+          <span>{t("nameUnconfirmedBanner")}</span>
+        </div>
+      </Show>
       <div class="messages" ref={list}>
         <Show when={props.messages.length >= 50}>
           <button class="ghost center" onClick={props.onOlder}>
@@ -244,6 +281,7 @@ function InviteDialog(props: { onClose: () => void }) {
 }
 
 function AddDialog(props: { onClose: () => void; onAdded: (c: Contact) => void }) {
+  const [tab, setTab] = createSignal<"name" | "code">("name");
   const [code, setCode] = createSignal("");
   const [error, setError] = createSignal("");
 
@@ -251,24 +289,46 @@ function AddDialog(props: { onClose: () => void; onAdded: (c: Contact) => void }
     e.preventDefault();
     setError("");
     try {
-      props.onAdded(await api.addContact(code()));
+      const value = code().trim();
+      props.onAdded(tab() === "name" ? await api.addContactByName(value) : await api.addContact(value));
     } catch (err) {
-      setError(errorText(err));
+      setError(errorText(err, t));
     }
   }
 
   return (
     <Dialog title={t("addContact")} onClose={props.onClose}>
       <form onSubmit={add}>
-        <textarea
-          class="code"
-          rows={5}
-          placeholder={t("pasteCode")}
-          value={code()}
-          onInput={(e) => setCode(e.currentTarget.value)}
-          spellcheck={false}
-          autofocus
-        />
+        <div class="tabs">
+          <button type="button" classList={{ active: tab() === "name" }} onClick={() => { setTab("name"); setCode(""); }}>
+            {t("byName")}
+          </button>
+          <button type="button" classList={{ active: tab() === "code" }} onClick={() => { setTab("code"); setCode(""); }}>
+            {t("byCode")}
+          </button>
+        </div>
+        <Show
+          when={tab() === "code"}
+          fallback={
+            <input
+              placeholder={t("usernamePlaceholder")}
+              value={code()}
+              onInput={(e) => setCode(e.currentTarget.value)}
+              maxLength={32}
+              autofocus
+            />
+          }
+        >
+          <textarea
+            class="code"
+            rows={5}
+            placeholder={t("pasteCode")}
+            value={code()}
+            onInput={(e) => setCode(e.currentTarget.value)}
+            spellcheck={false}
+            autofocus
+          />
+        </Show>
         <Show when={error()}>
           <p class="error">{error()}</p>
         </Show>
@@ -295,6 +355,201 @@ function SafetyDialog(props: { contact: Contact; onClose: () => void; onChanged:
       >
         {props.contact.verified ? t("unmarkVerified") : t("markVerified")}
       </button>
+    </Dialog>
+  );
+}
+
+function SettingsDialog(props: { onClose: () => void }) {
+  const [settings, setSettings] = createSignal<Settings | null>(null);
+  const [email, setEmail] = createSignal("");
+  const [code, setCode] = createSignal("");
+  const [codeSent, setCodeSent] = createSignal(false);
+  const [error, setError] = createSignal("");
+  const [info, setInfo] = createSignal("");
+  const [pw, setPw] = createSignal("");
+  const [pw2, setPw2] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [confirmDelete, setConfirmDelete] = createSignal(false);
+
+  async function load() {
+    const s = await api.getSettings();
+    setSettings(s);
+    setEmail(s.email ?? "");
+  }
+  onMount(load);
+
+  async function attempt(action: () => Promise<void>) {
+    setError("");
+    setInfo("");
+    try {
+      await action();
+    } catch (err) {
+      setError(errorText(err, t));
+    }
+  }
+
+  return (
+    <Dialog title={t("settings")} onClose={props.onClose}>
+      <Show when={settings()} fallback={<p class="muted">{t("loading")}</p>}>
+        {(s) => (
+          <>
+            <label class="check">
+              <input
+                type="checkbox"
+                checked={s().readReceipts}
+                onChange={(e) => setSettings({ ...s(), readReceipts: e.currentTarget.checked })}
+              />
+              {t("readReceipts")}
+            </label>
+            <p class="muted small">{t("readReceiptsHint")}</p>
+
+            <h3 class="muted">{t("account")}</h3>
+            <Show when={s().discoverable !== null} fallback={<p class="muted small">{t("registryOff")}</p>}>
+              <label class="check">
+                <input
+                  type="checkbox"
+                  checked={s().discoverable ?? true}
+                  onChange={(e) => setSettings({ ...s(), discoverable: e.currentTarget.checked })}
+                />
+                {t("discoverable")}
+              </label>
+              <p class="muted small">{t("discoverableHint")}</p>
+              <label>
+                <span>
+                  {t("email")}
+                  <Show when={s().email}>
+                    {" · "}
+                    <span classList={{ ok: !!s().emailVerified, warn: !s().emailVerified }}>
+                      {s().emailVerified ? t("emailVerified") : t("emailNotVerified")}
+                    </span>
+                  </Show>
+                </span>
+                <div class="row">
+                  <input type="email" value={email()} onInput={(e) => setEmail(e.currentTarget.value)} />
+                  <button
+                    type="button"
+                    disabled={email().trim() === (s().email ?? "")}
+                    onClick={() => attempt(async () => {
+                      await api.setEmail(email());
+                      setCodeSent(email().trim() !== "");
+                      await load();
+                    })}
+                  >
+                    {t("change")}
+                  </button>
+                </div>
+                <small class="muted">{t("emailHint")}</small>
+              </label>
+              <Show when={s().email && !s().emailVerified}>
+                <label>
+                  {t("code")}
+                  <div class="row">
+                    <input value={code()} onInput={(e) => setCode(e.currentTarget.value)} inputMode="numeric" autocomplete="one-time-code" />
+                    <button
+                      type="button"
+                      onClick={() => attempt(async () => {
+                        await api.verifyEmail(code());
+                        setCode("");
+                        await load();
+                      })}
+                    >
+                      {t("verify")}
+                    </button>
+                  </div>
+                  <Show when={codeSent()}>
+                    <small class="muted">{t("codeSent")}</small>
+                  </Show>
+                </label>
+              </Show>
+            </Show>
+
+            <Show when={s().discoverable !== null}>
+              <h3 class="muted">{t("backup")}</h3>
+              <p class="muted small">{t("backupHint")}</p>
+              <Show
+                when={s().backupEnabled}
+                fallback={
+                  <>
+                    <input type="password" placeholder={t("backupPassword")} value={pw()} onInput={(e) => setPw(e.currentTarget.value)} autocomplete="new-password" />
+                    <input type="password" placeholder={t("backupConfirm")} value={pw2()} onInput={(e) => setPw2(e.currentTarget.value)} autocomplete="new-password" />
+                    <button
+                      type="button"
+                      disabled={busy() || pw().length < 10}
+                      onClick={() => attempt(async () => {
+                        if (pw() !== pw2()) throw t("passwordsDiffer");
+                        setBusy(true);
+                        try {
+                          await api.setBackupPassword(pw());
+                        } finally {
+                          setBusy(false);
+                        }
+                        setPw("");
+                        setPw2("");
+                        setInfo(t("backupDone"));
+                        await load();
+                      })}
+                    >
+                      {t("backupEnable")}
+                    </button>
+                  </>
+                }
+              >
+                <p class="small ok">{t("backupOn")}</p>
+                <div class="row">
+                  <button type="button" disabled={busy()} onClick={() => attempt(async () => {
+                    setBusy(true);
+                    try {
+                      await api.backupNow();
+                    } finally {
+                      setBusy(false);
+                    }
+                    setInfo(t("backupDone"));
+                  })}>
+                    {t("backupNow")}
+                  </button>
+                  <button type="button" class="ghost" onClick={() => attempt(async () => {
+                    await api.disableBackup();
+                    await load();
+                  })}>
+                    {t("backupDisable")}
+                  </button>
+                </div>
+              </Show>
+              <button
+                type="button"
+                class="ghost danger"
+                onClick={() => attempt(async () => {
+                  if (!confirmDelete()) {
+                    setConfirmDelete(true);
+                    return;
+                  }
+                  await api.deleteAccount();
+                  setConfirmDelete(false);
+                  setInfo(t("deleted"));
+                })}
+              >
+                {confirmDelete() ? t("deleteConfirm") : t("deleteAccount")}
+              </button>
+            </Show>
+
+            <Show when={info()}>
+              <p class="small ok">{info()}</p>
+            </Show>
+            <Show when={error()}>
+              <p class="error">{error()}</p>
+            </Show>
+            <button
+              class="primary"
+              onClick={() => attempt(async () => {
+                await api.saveSettings(s());
+                props.onClose();
+              })}
+            >
+              {t("save")}
+            </button>
+          </>
+        )}
+      </Show>
     </Dialog>
   );
 }

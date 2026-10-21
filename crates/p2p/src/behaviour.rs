@@ -17,6 +17,7 @@ const IDENTIFY_PROTOCOL: &str = "/outpostwave/id/1";
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
     pub relay: relay::client::Behaviour,
+    pub relay_server: Toggle<relay::Behaviour>,
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
@@ -30,6 +31,7 @@ impl Behaviour {
         key: &identity::Keypair,
         relay: relay::client::Behaviour,
         enable_mdns: bool,
+        relay_server: bool,
     ) -> std::io::Result<Self> {
         let peer_id = key.public().to_peer_id();
         let identify = identify::Behaviour::new(
@@ -54,8 +56,23 @@ impl Behaviour {
             [(DM_PROTOCOL, request_response::ProtocolSupport::Full)],
             request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
         );
+        // Relay limits: long enough for messages and file chunks; DCUtR upgrades to direct.
+        let relay_server = relay_server.then(|| {
+            relay::Behaviour::new(
+                peer_id,
+                relay::Config {
+                    max_reservations: 4096,
+                    max_circuits: 4096,
+                    max_circuits_per_peer: 16,
+                    max_circuit_duration: Duration::from_secs(30 * 60),
+                    max_circuit_bytes: 64 * 1024 * 1024,
+                    ..relay::Config::default()
+                },
+            )
+        });
         Ok(Self {
             relay,
+            relay_server: relay_server.into(),
             dcutr: dcutr::Behaviour::new(peer_id),
             identify,
             ping: ping::Behaviour::new(ping::Config::new()),

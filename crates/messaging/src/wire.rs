@@ -1,15 +1,24 @@
-//! Plaintext frame carried inside an encrypted envelope.
+//! Plaintext frames carried inside an encrypted envelope.
+//!
+//! Every frame starts with `version u8 = 1 | kind u8`.
+//!
+//! Text (kind 1):
 //!
 //! ```text
 //! version u8 = 1 | kind u8 | msg_id 16 | sent_at i64 BE (Unix ms) | flags u8
 //! [intro, if flags & 1: name_len u8 | name | master_pub 32 | cert_len u16 BE | cert]
 //! body (UTF-8, rest of the frame)
 //! ```
+//!
+//! Read receipt (kind 2): `version | kind | count u16 BE | msg_id 16 × count`.
 
 use crate::MessagingError;
 
 const VERSION: u8 = 1;
 const KIND_TEXT: u8 = 1;
+const KIND_RECEIPT: u8 = 2;
+/// Maximum number of message ids in one read receipt.
+pub(crate) const MAX_RECEIPT_IDS: usize = 512;
 const FLAG_INTRO: u8 = 1;
 /// Maximum text length, in bytes.
 pub const MAX_TEXT_LEN: usize = 16 * 1024;
@@ -100,9 +109,63 @@ impl TextFrame {
     }
 }
 
+/// Any frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Frame {
+    /// Text message.
+    Text(TextFrame),
+    /// The listed messages were read.
+    Receipt(Vec<[u8; 16]>),
+}
+
+impl Frame {
+    pub(crate) fn encode_receipt(ids: &[[u8; 16]]) -> Vec<u8> {
+        let ids = &ids[..ids.len().min(MAX_RECEIPT_IDS)];
+        let mut out = vec![VERSION, KIND_RECEIPT];
+        out.extend_from_slice(&u16::try_from(ids.len()).unwrap_or(0).to_be_bytes());
+        for id in ids {
+            out.extend_from_slice(id);
+        }
+        out
+    }
+
+    pub(crate) fn decode(b: &[u8]) -> Result<Self, MessagingError> {
+        let bad = || MessagingError::Crypto(ow_crypto::CryptoError::Malformed);
+        match b {
+            [VERSION, KIND_TEXT, ..] => TextFrame::decode(b).map(Self::Text),
+            [VERSION, KIND_RECEIPT, c0, c1, rest @ ..] => {
+                let count = usize::from(u16::from_be_bytes([*c0, *c1]));
+                if count > MAX_RECEIPT_IDS || rest.len() != count * 16 {
+                    return Err(bad());
+                }
+                Ok(Self::Receipt(
+                    rest.chunks_exact(16)
+                        .map(|c| {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(c);
+                            id
+                        })
+                        .collect(),
+                ))
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Intro, TextFrame};
+    use super::{Frame, Intro, TextFrame};
+
+    #[test]
+    fn receipt_roundtrip() {
+        let ids = vec![[1; 16], [2; 16]];
+        assert_eq!(
+            Frame::decode(&Frame::encode_receipt(&ids)).unwrap(),
+            Frame::Receipt(ids)
+        );
+        assert!(Frame::decode(&[1, 2, 0, 1, 0]).is_err());
+    }
 
     #[test]
     fn roundtrip() {

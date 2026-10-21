@@ -23,7 +23,12 @@ mod node;
 pub use config::P2pConfig;
 pub use error::P2pError;
 pub use libp2p::{Multiaddr, PeerId, multiaddr};
-pub use node::{P2pEvent, P2pHandle, ReplyToken, device_key_of, peer_id_of, start};
+pub use node::{P2pEvent, P2pHandle, ReplyToken, circuit_addr, device_key_of, peer_id_of, start};
+
+/// Key seed of the **development** relay (`ow-relay --dev`). Public, never use in production.
+pub const DEV_RELAY_SEED: [u8; 32] = *b"outpostwave-dev-relay-not-secret";
+/// Port of the development relay.
+pub const DEV_RELAY_PORT: u16 = 4001;
 
 /// Maximum size of a direct-message payload (encrypted envelope), in bytes.
 pub const MAX_PAYLOAD: usize = 64 * 1024;

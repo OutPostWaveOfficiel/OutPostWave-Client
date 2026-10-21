@@ -23,7 +23,9 @@ tauri-build = { version = "2.7", features = [] }
 [dependencies]
 tauri = { version = "2.12", features = [] }
 serde = { version = "1", features = ["derive"] }
+ow-identity = { path = "../../crates/identity" }
 ow-messaging = { path = "../../crates/messaging" }
+ow-p2p = { path = "../../crates/p2p" }
 ow-storage = { path = "../../crates/storage", features = ["os-keystore"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tokio = { version = "1", features = ["sync"] }

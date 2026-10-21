@@ -15,9 +15,10 @@ members = [
     "crates/storage",
     "crates/search",
     "crates/antispam",
+    "crates/registry",
     "app/src-tauri",
 ]
-default-members = ["crates/identity", "crates/crypto", "crates/p2p", "crates/messaging", "crates/files", "crates/voice", "crates/video", "crates/screenshare", "crates/plugins", "crates/presence", "crates/mumblelink", "crates/storage", "crates/search", "crates/antispam", "app/src-tauri"]
+default-members = ["crates/identity", "crates/crypto", "crates/p2p", "crates/messaging", "crates/files", "crates/voice", "crates/video", "crates/screenshare", "crates/plugins", "crates/presence", "crates/mumblelink", "crates/storage", "crates/search", "crates/antispam", "crates/registry", "app/src-tauri"]
 
 [workspace.package]
 version = "0.0.1"

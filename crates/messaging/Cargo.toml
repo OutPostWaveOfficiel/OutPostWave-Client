@@ -13,12 +13,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+argon2 = "0.6"
+base64 = "0.23"
+chacha20poly1305 = "0.11"
 getrandom = "0.4"
 ow-crypto = { path = "../crypto" }
 ow-identity = { path = "../identity" }
 ow-p2p = { path = "../p2p" }
+ow-registry = { path = "../registry" }
 ow-storage = { path = "../storage" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 zeroize = "1.9"
 

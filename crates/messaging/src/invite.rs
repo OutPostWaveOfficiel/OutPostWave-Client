@@ -110,7 +110,7 @@ impl Invite {
         if cert.master() != &master {
             return Err(bad());
         }
-        let handle = Handle::new(&name, &master).map_err(|_| bad())?;
+        let handle = Handle::new(&name).map_err(|_| bad())?;
         Ok(Self {
             handle,
             master,

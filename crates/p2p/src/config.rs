@@ -22,6 +22,11 @@ pub struct P2pConfig {
     /// device is behind a NAT.
     #[zeroize(skip)]
     pub relays: Vec<Multiaddr>,
+    /// Act as a relay for other peers (official relays, or group members for mesh routing).
+    pub relay_server: bool,
+    /// Publicly reachable addresses of this node (needed by relays).
+    #[zeroize(skip)]
+    pub external_addrs: Vec<Multiaddr>,
 }
 
 impl P2pConfig {
@@ -44,6 +49,8 @@ impl P2pConfig {
             mdns: true,
             bootstrap: Vec::new(),
             relays: Vec::new(),
+            relay_server: false,
+            external_addrs: Vec::new(),
         }
     }
 }
@@ -55,6 +62,8 @@ impl fmt::Debug for P2pConfig {
             .field("mdns", &self.mdns)
             .field("bootstrap", &self.bootstrap)
             .field("relays", &self.relays)
+            .field("relay_server", &self.relay_server)
+            .field("external_addrs", &self.external_addrs)
             .finish_non_exhaustive()
     }
 }

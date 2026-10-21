@@ -19,10 +19,6 @@ pub enum IdentityError {
     InvalidDeviceName,
     /// The handle name breaks the naming rules.
     InvalidName,
-    /// The handle is not of the form `name#tag`.
-    InvalidHandle,
-    /// The handle tag does not match the public key.
-    TagMismatch,
 }
 
 impl fmt::Display for IdentityError {
@@ -35,8 +31,6 @@ impl fmt::Display for IdentityError {
             Self::Malformed => "malformed data",
             Self::InvalidDeviceName => "invalid device name",
             Self::InvalidName => "invalid name",
-            Self::InvalidHandle => "invalid handle, expected name#tag",
-            Self::TagMismatch => "handle tag does not match the public key",
         })
     }
 }

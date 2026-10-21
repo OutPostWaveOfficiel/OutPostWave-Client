@@ -22,7 +22,7 @@ fn open(path: &std::path::Path, key: &DbKey) -> Storage {
 }
 
 fn start(storage: Storage, port: u16) -> (Messenger, Receiver<MessengerEvent>) {
-    Messenger::start(storage, |cfg| {
+    Messenger::start(storage, None, |cfg| {
         cfg.listen = vec![
             format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
                 .parse()
@@ -76,7 +76,7 @@ async fn chat_and_offline_delivery() {
     let phrase = ProfileSetup::create(&s, "Bob", "Bob PC").unwrap();
     assert_eq!(phrase.words().count(), 24);
     let (bob, mut b_rx) = start(s, port_b);
-    assert!(bob.handle().starts_with("bob#"));
+    assert_eq!(bob.handle(), "bob");
 
     // Alice adds Bob from his invite and writes first.
     let contact_bob = alice
@@ -118,6 +118,24 @@ async fn chat_and_offline_delivery() {
     })
     .await;
 
+    // Bob reads it: Alice sees "read".
+    assert_eq!(bob.mark_read(contact_alice).unwrap(), 1);
+    assert_eq!(bob.mark_read(contact_alice).unwrap(), 0);
+    wait_for(&mut a_rx, |e| {
+        matches!(
+            e,
+            MessengerEvent::Status {
+                status: MessageStatus::Read,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        alice.messages(contact_bob.id, None, 1).unwrap()[0].status,
+        MessageStatus::Read
+    );
+
     // Bob answers.
     bob.send_text(contact_alice, "Salut Alice").unwrap();
     let e = wait_for(
@@ -148,6 +166,9 @@ async fn chat_and_offline_delivery() {
         unreachable!()
     };
     assert_eq!(message.body, "Tu es là ?");
+    // Read receipts can be disabled.
+    bob.set_read_receipts(false).unwrap();
+    assert!(!bob.read_receipts().unwrap());
     // History survived the restart (encrypted database).
     assert_eq!(bob.messages(contact_alice, None, 10).unwrap().len(), 3);
 }

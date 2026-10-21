@@ -15,15 +15,18 @@
 //! Messages to an offline contact stay `Pending` and are re-sent when the contact's device comes
 //! online (discovered or connected).
 
+mod backup;
 mod base32;
 mod error;
 mod invite;
 mod messenger;
 mod wire;
 
+pub use backup::MIN_PASSWORD_LEN;
 pub use error::MessagingError;
 pub use invite::Invite;
-pub use messenger::{ContactInfo, Messenger, MessengerEvent, ProfileSetup};
+pub use messenger::{ContactInfo, Messenger, MessengerEvent, NewProfile, ProfileSetup};
 pub use ow_identity::RecoveryPhrase;
+pub use ow_registry::{AccountInfo, RegistryClient, RegistryError};
 pub use ow_storage::{ContactId, MessageStatus, StoredMessage};
 pub use wire::MAX_TEXT_LEN;

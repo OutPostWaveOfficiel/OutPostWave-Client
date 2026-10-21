@@ -94,7 +94,7 @@ label.check input { width: auto; }
 /* Main layout */
 .layout { display: grid; grid-template-columns: 280px 1fr; height: 100%; }
 .sidebar { background: var(--ow-panel); border-right: 1px solid var(--ow-border); padding: 1rem; overflow-y: auto; }
-.me { font-size: 1.05rem; margin-bottom: 0.75rem; word-break: break-all; }
+.me { display: flex; align-items: center; justify-content: space-between; font-size: 1.05rem; margin-bottom: 0.75rem; word-break: break-all; }
 .actions { display: grid; gap: 0.5rem; }
 .contacts { list-style: none; margin: 0; padding: 0; }
 .contacts button { display: flex; align-items: center; gap: 0.5rem; width: 100%; border: none; background: none; text-align: left; }
@@ -126,3 +126,14 @@ label.check input { width: auto; }
   .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { border-right: none; border-bottom: 1px solid var(--ow-border); max-height: 40vh; }
 }
+
+.row { display: flex; gap: 0.5rem; }
+.ok { color: var(--ow-online); }
+.warn { color: var(--ow-danger); }
+button.link { width: 100%; margin-top: 0.5rem; color: var(--ow-accent); }
+button.back { padding-left: 0; margin-bottom: 0.5rem; }
+.alert { color: var(--ow-danger); }
+.banner { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1rem; background: var(--ow-warn-bg); font-size: 0.9rem; }
+.banner span { flex: 1; }
+button.danger { color: var(--ow-danger); }
+.dialog input[type="password"] { margin-bottom: 0.4rem; }

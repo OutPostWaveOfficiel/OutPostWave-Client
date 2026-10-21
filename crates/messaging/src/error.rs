@@ -17,6 +17,12 @@ pub enum MessagingError {
     UnknownContact,
     /// Message text is empty or too long.
     InvalidText,
+    /// Backup error.
+    Backup(&'static str),
+    /// No account server configured.
+    NoRegistry,
+    /// Account server error.
+    Registry(ow_registry::RegistryError),
     /// Identity error.
     Identity(ow_identity::IdentityError),
     /// Storage error.
@@ -36,6 +42,9 @@ impl fmt::Display for MessagingError {
             Self::OwnInvite => f.write_str("this is your own invite code"),
             Self::UnknownContact => f.write_str("unknown contact"),
             Self::InvalidText => f.write_str("message is empty or too long"),
+            Self::Backup(e) => write!(f, "backup: {e}"),
+            Self::NoRegistry => f.write_str("no account server configured"),
+            Self::Registry(e) => write!(f, "{e}"),
             Self::Identity(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Crypto(e) => write!(f, "{e}"),
@@ -64,5 +73,10 @@ impl From<ow_crypto::CryptoError> for MessagingError {
 impl From<ow_p2p::P2pError> for MessagingError {
     fn from(e: ow_p2p::P2pError) -> Self {
         Self::P2p(e)
+    }
+}
+impl From<ow_registry::RegistryError> for MessagingError {
+    fn from(e: ow_registry::RegistryError) -> Self {
+        Self::Registry(e)
     }
 }

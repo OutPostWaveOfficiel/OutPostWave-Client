@@ -24,7 +24,11 @@ export function App() {
         <div class="center-screen muted">{t("noBackend")}</div>
       </Match>
       <Match when={handle() === null}>
-        <Onboarding defaultDevice={OS_NAMES[info()?.os ?? ""] ?? "PC"} onDone={() => void refetch()} />
+        <Onboarding
+          defaultDevice={OS_NAMES[info()?.os ?? ""] ?? "PC"}
+          registry={info()?.registry ?? false}
+          onDone={() => void refetch()}
+        />
       </Match>
       <Match when={handle()}>{(h) => <Main handle={h()} />}</Match>
     </Switch>

@@ -18,7 +18,8 @@ libp2p = { version = "0.57", features = [
     "tokio", "quic", "tcp", "noise", "yamux", "dns", "ed25519",
     "identify", "ping", "mdns", "kad", "relay", "dcutr", "request-response", "macros",
 ] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+getrandom = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tracing = "0.1"
 zeroize = { version = "1.9", features = ["derive"] }
 
@@ -31,3 +32,4 @@ aws-lc-sys = { version = "0.46", features = ["prebuilt-nasm"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ed25519-dalek = "3"
+libp2p = { version = "0.57", features = ["macros"] }

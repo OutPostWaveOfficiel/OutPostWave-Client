@@ -45,6 +45,8 @@ pub struct ContactDto {
     verified: bool,
     online: bool,
     safety_number: String,
+    key_changed: bool,
+    name_unconfirmed: bool,
 }
 
 impl From<ContactInfo> for ContactDto {
@@ -56,6 +58,8 @@ impl From<ContactInfo> for ContactDto {
             verified: c.verified,
             online: c.online,
             safety_number: c.safety_number,
+            key_changed: c.key_changed,
+            name_unconfirmed: c.name_unconfirmed,
         }
     }
 }
@@ -105,6 +109,8 @@ pub enum EventDto {
     Contacts,
     /// Contact presence.
     Presence { contact: i64, online: bool },
+    /// A contact's keys changed.
+    KeyChanged { contact: i64 },
     /// Events were lost: reload everything.
     Resync,
 }
@@ -126,6 +132,7 @@ impl From<MessengerEvent> for EventDto {
                 status: status(s),
             },
             MessengerEvent::ContactsChanged => Self::Contacts,
+            MessengerEvent::KeyChanged { contact } => Self::KeyChanged { contact: contact.0 },
             MessengerEvent::Presence { contact, online } => Self::Presence {
                 contact: contact.0,
                 online,

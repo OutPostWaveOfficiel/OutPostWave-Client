@@ -195,6 +195,10 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
     let key = key?;
     let peer_id = key.public().to_peer_id();
     let mdns = config.mdns;
+    let relay_server = config.relay_server;
+    // A relay must announce addresses in reservations: without explicit external addresses,
+    // announce its listen addresses (fine on a LAN or a server with a public IP).
+    let auto_external = relay_server && config.external_addrs.is_empty();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
@@ -210,7 +214,7 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| P2pError::Transport(e.to_string()))?
         .with_behaviour(|key, relay| {
-            Behaviour::new(key, relay, mdns)
+            Behaviour::new(key, relay, mdns, relay_server)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         })
         .map_err(|e| P2pError::Transport(e.to_string()))?
@@ -222,6 +226,9 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
             tracing::warn!(%addr, %e, "cannot listen");
         }
     }
+    for addr in &config.external_addrs {
+        swarm.add_external_address(addr.clone());
+    }
     for addr in &config.bootstrap {
         if let Some(peer) = peer_of_addr(addr) {
             swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
@@ -232,6 +239,9 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
     }
     for addr in &config.relays {
         // Reserve a slot on the relay so peers can reach us through it.
+        if let Some(peer) = peer_of_addr(addr) {
+            swarm.add_peer_address(peer, addr.clone());
+        }
         if let Err(e) = swarm.listen_on(addr.clone().with(Protocol::P2pCircuit)) {
             tracing::warn!(%addr, %e, "cannot listen through relay");
         }
@@ -239,7 +249,9 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (ev_tx, ev_rx) = mpsc::channel(256);
-    tokio::spawn(Node::new(swarm, cmd_rx, ev_tx).run());
+    let mut node = Node::new(swarm, cmd_rx, ev_tx);
+    node.auto_external = auto_external;
+    tokio::spawn(node.run());
     Ok((
         P2pHandle {
             peer_id,
@@ -247,6 +259,15 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
         },
         ev_rx,
     ))
+}
+
+/// Address to reach `peer` through `relay` (a relay address including `/p2p/<relay id>`).
+#[must_use]
+pub fn circuit_addr(relay: &Multiaddr, peer: PeerId) -> Multiaddr {
+    relay
+        .clone()
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(peer))
 }
 
 fn peer_of_addr(addr: &Multiaddr) -> Option<PeerId> {
@@ -267,6 +288,7 @@ struct Node {
     pending_sends: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, P2pError>>>,
     inbound: HashMap<ReplyToken, ResponseChannel<Vec<u8>>>,
     next_token: u64,
+    auto_external: bool,
 }
 
 impl Node {
@@ -283,6 +305,7 @@ impl Node {
             pending_sends: HashMap::new(),
             inbound: HashMap::new(),
             next_token: 0,
+            auto_external: false,
         }
     }
 
@@ -341,6 +364,9 @@ impl Node {
     async fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
+                if self.auto_external {
+                    self.swarm.add_external_address(address.clone());
+                }
                 let _ = self.events.send(P2pEvent::Listening(address)).await;
             }
             SwarmEvent::ConnectionEstablished {

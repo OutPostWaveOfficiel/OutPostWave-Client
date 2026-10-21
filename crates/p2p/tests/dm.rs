@@ -96,3 +96,58 @@ async fn peer_id_is_the_device_key() {
     assert_eq!(node.peer_id(), peer_id_of(&device_pub).unwrap());
     assert_eq!(device_key_of(&node.peer_id()), Some(device_pub));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dm_through_relay() {
+    // Relay node.
+    let mut cfg = P2pConfig::new([10; 32]);
+    cfg.listen = vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()];
+    cfg.mdns = false;
+    cfg.relay_server = true;
+    let (relay, mut r_events) = start(cfg).unwrap();
+    let relay_listen = first_listen_addr(&mut r_events).await;
+    let relay_addr = relay_listen.with(libp2p::multiaddr::Protocol::P2p(relay.peer_id()));
+    tokio::spawn(async move { while r_events.recv().await.is_some() {} });
+
+    // Bob only reachable through the relay (no direct address shared).
+    let mut cfg = P2pConfig::new([11; 32]);
+    cfg.listen = vec![];
+    cfg.mdns = false;
+    cfg.relays = vec![relay_addr.clone()];
+    let (bob, mut b_events) = start(cfg).unwrap();
+    // Wait for the relayed listen address (reservation accepted).
+    timeout(T, async {
+        loop {
+            if let Some(P2pEvent::Listening(a)) = b_events.recv().await {
+                if a.to_string().contains("p2p-circuit") {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("no relay reservation");
+    let b2 = bob.clone();
+    tokio::spawn(async move {
+        while let Some(e) = b_events.recv().await {
+            if let P2pEvent::Message { payload, token, .. } = e {
+                b2.reply(token, payload).await.unwrap();
+            }
+        }
+    });
+
+    let mut cfg = P2pConfig::new([12; 32]);
+    cfg.listen = vec![];
+    cfg.mdns = false;
+    let (alice, _a) = start(cfg).unwrap();
+    let via = ow_p2p::circuit_addr(&relay_addr, bob.peer_id());
+    timeout(T, alice.dial(bob.peer_id(), vec![via]))
+        .await
+        .unwrap()
+        .unwrap();
+    let reply = timeout(T, alice.send(bob.peer_id(), b"via relay".to_vec()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, b"via relay");
+}

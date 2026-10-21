@@ -258,6 +258,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Certificate of a contact device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn contact_device_cert(&self, device_pub: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT certificate FROM contact_devices WHERE device_pub = ?1",
+                [&device_pub[..]],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Device public keys of a contact.
     ///
     /// # Errors
@@ -304,6 +320,58 @@ impl Storage {
             )
             .optional()?
             .transpose()
+    }
+
+    /// Merges contact `src` into `dst` after a verified key change: `dst` takes the identity
+    /// (`new_master`) and devices of `src`, its old devices are removed, the conversations are
+    /// joined, `src` is deleted and `dst` must be verified again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn merge_contact(
+        &self,
+        src: ContactId,
+        dst: ContactId,
+        new_master: &[u8; 32],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let conv = |id: ContactId| -> Result<Option<i64>> {
+            Ok(tx
+                .query_row(
+                    "SELECT id FROM conversations WHERE contact_id = ?1",
+                    [id.0],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        };
+        match (conv(src)?, conv(dst)?) {
+            (Some(from), Some(to)) => {
+                tx.execute(
+                    "UPDATE messages SET conversation_id = ?2 WHERE conversation_id = ?1",
+                    params![from, to],
+                )?;
+            }
+            (Some(from), None) => {
+                tx.execute(
+                    "UPDATE conversations SET contact_id = ?2 WHERE id = ?1",
+                    params![from, dst.0],
+                )?;
+            }
+            _ => {}
+        }
+        tx.execute("DELETE FROM contact_devices WHERE contact_id = ?1", [dst.0])?;
+        tx.execute(
+            "UPDATE contact_devices SET contact_id = ?2 WHERE contact_id = ?1",
+            params![src.0, dst.0],
+        )?;
+        tx.execute("DELETE FROM contacts WHERE id = ?1", [src.0])?;
+        tx.execute(
+            "UPDATE contacts SET master_pub = ?2, verified = 0 WHERE id = ?1",
+            params![dst.0, &new_master[..]],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // --- conversations and messages -------------------------------------------------------
@@ -381,6 +449,24 @@ impl Storage {
         rows.map(|r| r?).collect()
     }
 
+    /// All messages of a contact, newest first, at most `limit` (for backups).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn contact_messages(&self, contact: ContactId, limit: u32) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.id, m.conversation_id, m.msg_id, m.sender_device, m.outgoing, m.sent_at,
+                    m.received_at, m.status, m.body
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE c.contact_id = ?1
+             ORDER BY m.sent_at DESC, m.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![contact.0, limit], message_from_row)?;
+        rows.map(|r| r?).collect()
+    }
+
     /// Outgoing messages of a conversation not yet delivered, oldest first.
     ///
     /// # Errors
@@ -396,6 +482,22 @@ impl Storage {
         )?;
         let rows = stmt.query_map([conversation.0], message_from_row)?;
         rows.map(|r| r?).collect()
+    }
+
+    /// Marks incoming messages of a conversation as read locally and returns their ids
+    /// (to send read receipts).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn mark_incoming_read(&self, conversation: ConversationId) -> Result<Vec<[u8; 16]>> {
+        let mut stmt = self.conn.prepare_cached(
+            "UPDATE messages SET status = 3
+             WHERE conversation_id = ?1 AND outgoing = 0 AND status = 4
+             RETURNING msg_id",
+        )?;
+        let rows = stmt.query_map([conversation.0], |r| r.get::<_, Vec<u8>>(0))?;
+        rows.map(|r| to_array(&r?, "message id")).collect()
     }
 
     /// Updates the status of a message. Statuses only move forward (never back from
@@ -644,6 +746,40 @@ mod tests {
             4,
             "msg 4 is read, others pending"
         );
+
+        let incoming = NewMessage {
+            msg_id: [9; 16],
+            outgoing: false,
+            status: MessageStatus::Received,
+            ..m.clone()
+        };
+        s.insert_message(&incoming).unwrap();
+        assert_eq!(s.mark_incoming_read(conv).unwrap(), vec![[9; 16]]);
+        assert!(s.mark_incoming_read(conv).unwrap().is_empty(), "only once");
+
+        // Key change: a new contact entry (same person, new identity) is merged into the old one.
+        let c_new = s
+            .upsert_contact(&NewContact {
+                master_pub: [5; 32],
+                handle: "alice2".into(),
+                display_name: None,
+                added_at: 3,
+            })
+            .unwrap();
+        s.add_contact_device(c_new, &[6; 32], b"cert2").unwrap();
+        let conv_new = s.dm_conversation(c_new, 3).unwrap();
+        let mut m2 = m.clone();
+        m2.conversation = conv_new;
+        m2.msg_id = [42; 16];
+        s.insert_message(&m2).unwrap();
+        let before = s.contact_messages(c, 100).unwrap().len();
+        s.merge_contact(c_new, c, &[5; 32]).unwrap();
+        let merged = s.contact(c).unwrap().unwrap();
+        assert_eq!(merged.master_pub, [5; 32]);
+        assert!(!merged.verified);
+        assert_eq!(s.contact_devices(c).unwrap(), vec![[6; 32]]);
+        assert_eq!(s.contact_messages(c, 100).unwrap().len(), before + 1);
+        assert!(s.contact(c_new).unwrap().is_none());
 
         s.delete_contact(c).unwrap();
         assert!(

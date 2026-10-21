@@ -8,14 +8,18 @@ use ow_crypto::{CryptoAccount, Envelope, PeerSessions, PrekeyBundle, pickle_key}
 use ow_identity::{
     DeviceCertificate, DeviceKey, Handle, MasterKey, PublicKey, RecoveryPhrase, safety_number,
 };
-use ow_p2p::{Multiaddr, P2pConfig, P2pEvent, P2pHandle, PeerId, device_key_of, peer_id_of};
+use ow_p2p::{
+    Multiaddr, P2pConfig, P2pEvent, P2pHandle, PeerId, circuit_addr, device_key_of, peer_id_of,
+};
+use ow_registry::{AccountInfo, RegistryClient};
 use ow_storage::{
     ContactId, LocalIdentity, MessageStatus, NewContact, NewMessage, Storage, StoredMessage,
 };
 use tokio::sync::{broadcast, mpsc};
 use zeroize::Zeroizing;
 
-use crate::wire::{Intro, MAX_TEXT_LEN, TextFrame};
+use crate::backup::{BackupContact, BackupData, BackupDevice, BackupKey, BackupMessage};
+use crate::wire::{Frame, Intro, MAX_RECEIPT_IDS, MAX_TEXT_LEN, TextFrame};
 use crate::{Invite, MessagingError, base32};
 
 type Result<T> = core::result::Result<T, MessagingError>;
@@ -23,6 +27,26 @@ type Result<T> = core::result::Result<T, MessagingError>;
 const ACK_OK: &[u8] = b"ok";
 const ACK_ERR: &[u8] = b"err";
 const SECRET_ACCOUNT: &str = "olm:account";
+const SETTING_READ_RECEIPTS: &str = "setting:read_receipts";
+const SECRET_BACKUP_KEY: &str = "backup:key";
+/// Interval between automatic backups (when something changed).
+const BACKUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Backup size budget (the registry accepts up to 16 MiB).
+const BACKUP_BUDGET: usize = 12 * 1024 * 1024;
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn unb64<const N: usize>(s: &str) -> Option<[u8; N]> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .ok()?
+        .try_into()
+        .ok()
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -72,68 +96,136 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// One-shot identity creation on a fresh device.
+/// Identity creation on a fresh device.
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSetup;
 
+/// An identity prepared in memory, not yet saved. Register it on the registry (to claim the
+/// username) before calling [`NewProfile::commit`].
+pub struct NewProfile {
+    phrase: Option<RecoveryPhrase>,
+    handle: Handle,
+    device: DeviceKey,
+    cert: DeviceCertificate,
+    account: CryptoAccount,
+}
+
+impl core::fmt::Debug for NewProfile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "NewProfile({})", self.handle)
+    }
+}
+
 impl ProfileSetup {
-    /// Creates a new identity. Returns the recovery phrase, to show **once** to the user.
+    /// Prepares a brand-new identity (random recovery phrase).
+    ///
+    /// # Errors
+    ///
+    /// Invalid name or device name, RNG failure.
+    pub fn prepare_new(name: &str, device_name: &str) -> Result<NewProfile> {
+        let phrase = RecoveryPhrase::generate()?;
+        let mut p = Self::prepare(&phrase, name, device_name)?;
+        p.phrase = Some(phrase);
+        Ok(p)
+    }
+
+    /// Prepares this device for an existing identity, from its recovery phrase.
+    ///
+    /// # Errors
+    ///
+    /// Invalid phrase, name or device name.
+    pub fn prepare_restore(phrase: &str, name: &str, device_name: &str) -> Result<NewProfile> {
+        Self::prepare(&RecoveryPhrase::parse(phrase)?, name, device_name)
+    }
+
+    fn prepare(phrase: &RecoveryPhrase, name: &str, device_name: &str) -> Result<NewProfile> {
+        let master = MasterKey::from_phrase(phrase);
+        let handle = Handle::new(name)?;
+        let device = DeviceKey::generate()?;
+        let cert = DeviceCertificate::issue(&master, &device.public_key(), device_name, now_s())?;
+        Ok(NewProfile {
+            phrase: None,
+            handle,
+            device,
+            cert,
+            account: CryptoAccount::new(),
+        })
+    }
+
+    /// Creates and saves a new identity without registry (tests, offline mode). Returns the
+    /// recovery phrase, to show **once** to the user.
     ///
     /// # Errors
     ///
     /// [`MessagingError::IdentityExists`], invalid name or device name, storage errors.
     pub fn create(storage: &Storage, name: &str, device_name: &str) -> Result<RecoveryPhrase> {
-        if storage.load_local_identity()?.is_some() {
-            return Err(MessagingError::IdentityExists);
-        }
-        let phrase = RecoveryPhrase::generate()?;
-        Self::install(storage, &phrase, name, device_name)?;
-        Ok(phrase)
+        Self::prepare_new(name, device_name)?
+            .commit(storage)?
+            .ok_or(MessagingError::NoIdentity)
     }
 
-    /// Restores an identity from its recovery phrase on a new device.
-    ///
-    /// Contacts and history are not restored (they live on the other devices).
+    /// Restores an identity from its recovery phrase without registry.
     ///
     /// # Errors
     ///
     /// [`MessagingError::IdentityExists`], invalid phrase, name or device name, storage errors.
     pub fn restore(storage: &Storage, phrase: &str, name: &str, device_name: &str) -> Result<()> {
+        Self::prepare_restore(phrase, name, device_name)?
+            .commit(storage)
+            .map(|_| ())
+    }
+}
+
+impl NewProfile {
+    /// Username.
+    #[must_use]
+    pub const fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    /// Device key.
+    #[must_use]
+    pub const fn device(&self) -> &DeviceKey {
+        &self.device
+    }
+
+    /// Device certificate.
+    #[must_use]
+    pub const fn cert(&self) -> &DeviceCertificate {
+        &self.cert
+    }
+
+    /// Current fallback prekey bundle (published on the registry).
+    pub fn bundle(&mut self) -> PrekeyBundle {
+        self.account.fallback_bundle(&self.device, now_s())
+    }
+
+    /// Saves the identity. Returns the recovery phrase for new identities (show it **once**).
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::IdentityExists`] or storage errors.
+    pub fn commit(self, storage: &Storage) -> Result<Option<RecoveryPhrase>> {
         if storage.load_local_identity()?.is_some() {
             return Err(MessagingError::IdentityExists);
         }
-        let phrase = RecoveryPhrase::parse(phrase)?;
-        Self::install(storage, &phrase, name, device_name)
-    }
-
-    fn install(
-        storage: &Storage,
-        phrase: &RecoveryPhrase,
-        name: &str,
-        device_name: &str,
-    ) -> Result<()> {
-        let master = MasterKey::from_phrase(phrase);
-        let handle = Handle::new(name, &master.public_key())?;
-        let device = DeviceKey::generate()?;
-        let cert = DeviceCertificate::issue(&master, &device.public_key(), device_name, now_s())?;
-        let account = CryptoAccount::new();
         storage.put_secret(
             SECRET_ACCOUNT,
-            account.pickle(&pickle_key(&device)).as_bytes(),
+            self.account.pickle(&pickle_key(&self.device)).as_bytes(),
             now_ms(),
         )?;
         // The master secret is not kept: adding a device requires the recovery phrase.
-        let mut device_secret = device.to_secret_bytes();
+        let mut device_secret = self.device.to_secret_bytes();
         let id = LocalIdentity {
-            handle_name: handle.name().to_owned(),
+            handle_name: self.handle.name().to_owned(),
             device_secret,
-            device_cert: cert.to_bytes(),
+            device_cert: self.cert.to_bytes(),
             master_secret: None,
             created_at: now_ms(),
         };
         zeroize::Zeroize::zeroize(&mut device_secret);
         storage.save_local_identity(&id)?;
-        Ok(())
+        Ok(self.phrase)
     }
 }
 
@@ -142,7 +234,7 @@ impl ProfileSetup {
 pub struct ContactInfo {
     /// Row id.
     pub id: ContactId,
-    /// Handle `name#tag`.
+    /// Username.
     pub handle: String,
     /// Local nickname.
     pub display_name: Option<String>,
@@ -152,6 +244,11 @@ pub struct ContactInfo {
     pub online: bool,
     /// Safety number to compare out of band.
     pub safety_number: String,
+    /// The contact's keys changed (account recovered or reinstalled): compare the safety number
+    /// again.
+    pub key_changed: bool,
+    /// The username was announced by the contact but not confirmed by the account server.
+    pub name_unconfirmed: bool,
 }
 
 /// Events for the UI.
@@ -175,6 +272,11 @@ pub enum MessengerEvent {
     },
     /// The contact list changed (added, updated).
     ContactsChanged,
+    /// A contact's keys changed (verified with the account server).
+    KeyChanged {
+        /// Contact.
+        contact: ContactId,
+    },
     /// A contact came online or went offline.
     Presence {
         /// Contact.
@@ -194,7 +296,8 @@ struct Net {
     addrs: HashMap<PeerId, Vec<Multiaddr>>,
     listening: Vec<Multiaddr>,
     online: HashSet<PeerId>,
-    delivering: HashSet<i64>,
+    /// Contacts with a delivery in progress, and whether another pass was requested.
+    delivering: HashMap<i64, bool>,
 }
 
 struct Inner {
@@ -207,6 +310,11 @@ struct Inner {
     crypto: Mutex<Crypto>,
     net: Mutex<Net>,
     p2p: P2pHandle,
+    registry: Option<RegistryClient>,
+    /// Something changed since the last backup.
+    backup_dirty: std::sync::atomic::AtomicBool,
+    /// Relays we hold a reservation on; contacts are tried through them too.
+    relays: Vec<Multiaddr>,
     events: broadcast::Sender<MessengerEvent>,
 }
 
@@ -234,6 +342,7 @@ impl Messenger {
     /// errors.
     pub fn start(
         storage: Storage,
+        registry: Option<RegistryClient>,
         configure: impl FnOnce(&mut P2pConfig),
     ) -> Result<(Self, broadcast::Receiver<MessengerEvent>)> {
         let id = storage
@@ -247,7 +356,7 @@ impl Messenger {
             ));
         }
         let master = *cert.master();
-        let handle = Handle::new(&id.handle_name, &master)?;
+        let handle = Handle::new(&id.handle_name)?;
         let pk = pickle_key(&device);
         let account = match storage.get_secret(SECRET_ACCOUNT)? {
             Some(p) => CryptoAccount::from_pickle(
@@ -259,6 +368,7 @@ impl Messenger {
 
         let mut cfg = P2pConfig::new(id.device_secret);
         configure(&mut cfg);
+        let relays = cfg.relays.clone();
         let (p2p, p2p_events) = ow_p2p::start(cfg)?;
         let (events, rx) = broadcast::channel(256);
 
@@ -275,11 +385,16 @@ impl Messenger {
             }),
             net: Mutex::new(Net::default()),
             p2p,
+            registry,
+            backup_dirty: std::sync::atomic::AtomicBool::new(false),
+            relays,
             events,
         });
         inner.save_account()?;
         tokio::spawn(Inner::event_loop(Arc::clone(&inner), p2p_events));
         tokio::spawn(Inner::reconnect_all(Arc::clone(&inner)));
+        tokio::spawn(Inner::startup_checks(Arc::clone(&inner)));
+        tokio::spawn(Inner::backup_loop(Arc::downgrade(&inner)));
         Ok((Self { inner }, rx))
     }
 
@@ -289,7 +404,7 @@ impl Messenger {
         self.inner.events.subscribe()
     }
 
-    /// Our handle `name#tag`.
+    /// Our username.
     #[must_use]
     pub fn handle(&self) -> String {
         self.inner.handle.to_string()
@@ -330,32 +445,120 @@ impl Messenger {
     /// [`MessagingError::InvalidInvite`], [`MessagingError::OwnInvite`], storage errors.
     pub fn add_contact(&self, code: &str) -> Result<ContactInfo> {
         let invite = Invite::parse(code)?;
+        let id = self.add_verified(
+            &invite.handle,
+            &invite.master,
+            &[(invite.cert, invite.bundle)],
+            invite.addrs,
+        )?;
+        // The name in an invite is self-asserted: confirm it with the account server.
+        lock(&self.inner.storage).put_secret(&format!("unconfirmed:{}", id.0), &[1], now_ms())?;
+        Inner::spawn_name_check(&self.inner, id);
+        self.contact(id)
+    }
+
+    /// Finds a user by exact username on the registry and adds them as a contact.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::Registry`] (not found, unreachable...), [`MessagingError::OwnInvite`],
+    /// storage errors.
+    pub async fn add_contact_by_name(&self, name: &str) -> Result<ContactInfo> {
+        let handle = Handle::new(name)?;
+        let found = self.registry()?.lookup(&handle).await?;
+        let id = self.add_verified(&found.name, &found.master, &found.devices, Vec::new())?;
+        lock(&self.inner.storage).delete_secret(&format!("unconfirmed:{}", id.0))?;
+        self.contact(id)
+    }
+
+    fn add_verified(
+        &self,
+        handle: &Handle,
+        master: &PublicKey,
+        devices: &[(DeviceCertificate, PrekeyBundle)],
+        addrs: Vec<Multiaddr>,
+    ) -> Result<ContactId> {
         let inner = &self.inner;
-        if invite.master == inner.master {
+        if master == &inner.master {
             return Err(MessagingError::OwnInvite);
         }
-        let device = invite.cert.device().to_bytes();
         let id = {
             let s = lock(&inner.storage);
             let id = s.upsert_contact(&NewContact {
-                master_pub: invite.master.to_bytes(),
-                handle: invite.handle.to_string(),
+                master_pub: master.to_bytes(),
+                handle: handle.to_string(),
                 display_name: None,
                 added_at: now_ms(),
             })?;
-            s.add_contact_device(id, &device, &invite.cert.to_bytes())?;
-            s.put_secret(
-                &key_name("bundle", &device),
-                &invite.bundle.to_bytes(),
-                now_ms(),
-            )?;
+            for (cert, bundle) in devices {
+                let device = cert.device().to_bytes();
+                s.add_contact_device(id, &device, &cert.to_bytes())?;
+                s.put_secret(&key_name("bundle", &device), &bundle.to_bytes(), now_ms())?;
+            }
             s.dm_conversation(id, now_ms())?;
             id
         };
-        inner.remember_addrs(&device, invite.addrs);
+        if let Some((cert, _)) = devices.first() {
+            inner.remember_addrs(&cert.device().to_bytes(), addrs);
+        }
         let _ = inner.events.send(MessengerEvent::ContactsChanged);
+        inner
+            .backup_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Inner::spawn_delivery(inner, id);
-        self.contact(id)
+        Ok(id)
+    }
+
+    fn registry(&self) -> Result<&RegistryClient> {
+        self.inner
+            .registry
+            .as_ref()
+            .ok_or(MessagingError::NoRegistry)
+    }
+
+    /// Our account on the registry (email, search visibility).
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn account(&self) -> Result<AccountInfo> {
+        Ok(self.registry()?.me(&self.inner.device).await?)
+    }
+
+    /// Shows or hides us in username search.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn set_discoverable(&self, discoverable: bool) -> Result<()> {
+        Ok(self
+            .registry()?
+            .set_discoverable(&self.inner.device, discoverable)
+            .await?)
+    }
+
+    /// Sets (or removes) the recovery email; a verification code is emailed.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn set_email(&self, email: Option<&str>) -> Result<()> {
+        Ok(self
+            .registry()?
+            .set_email(&self.inner.device, email)
+            .await?)
+    }
+
+    /// Confirms the recovery email with the received code.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn verify_email(&self, code: &str) -> Result<()> {
+        Ok(self
+            .registry()?
+            .verify_email(&self.inner.device, code)
+            .await?)
     }
 
     /// Contact details.
@@ -388,7 +591,13 @@ impl Messenger {
     ///
     /// Storage errors.
     pub fn set_verified(&self, id: ContactId, verified: bool) -> Result<()> {
-        lock(&self.inner.storage).set_contact_verified(id, verified)?;
+        {
+            let s = lock(&self.inner.storage);
+            s.set_contact_verified(id, verified)?;
+            if verified {
+                s.delete_secret(&format!("keychanged:{}", id.0))?;
+            }
+        }
         let _ = self.inner.events.send(MessengerEvent::ContactsChanged);
         Ok(())
     }
@@ -457,6 +666,147 @@ impl Messenger {
         Ok(message)
     }
 
+    /// Marks the conversation with `contact` as read. If read receipts are enabled, the contact
+    /// is told (now, or when it comes back online). Returns the number of newly read messages.
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn mark_read(&self, contact: ContactId) -> Result<usize> {
+        let inner = &self.inner;
+        let ids = {
+            let s = lock(&inner.storage);
+            let conv = s.dm_conversation(contact, now_ms())?;
+            s.mark_incoming_read(conv)?
+        };
+        if !ids.is_empty() && self.read_receipts()? {
+            let key = format!("receipts:{}", contact.0);
+            {
+                let s = lock(&inner.storage);
+                let mut queued = s.get_secret(&key)?.map(|b| b.to_vec()).unwrap_or_default();
+                for id in &ids {
+                    queued.extend_from_slice(id);
+                }
+                s.put_secret(&key, &queued, now_ms())?;
+            }
+            Inner::spawn_delivery(inner, contact);
+        }
+        Ok(ids.len())
+    }
+
+    /// Whether read receipts are sent (default: yes).
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn read_receipts(&self) -> Result<bool> {
+        Ok(lock(&self.inner.storage)
+            .get_secret(SETTING_READ_RECEIPTS)?
+            .is_none_or(|v| v.first() != Some(&0)))
+    }
+
+    /// Enables or disables sending read receipts.
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn set_read_receipts(&self, enabled: bool) -> Result<()> {
+        lock(&self.inner.storage).put_secret(
+            SETTING_READ_RECEIPTS,
+            &[u8::from(enabled)],
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// Deletes our account on the registry (username, email, backup). Local data is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::NoRegistry`] or registry errors.
+    pub async fn delete_account(&self) -> Result<()> {
+        Ok(self.registry()?.delete_account(&self.inner.device).await?)
+    }
+
+    /// Hides the "keys changed" warning of a contact without verifying the safety number.
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn ack_key_change(&self, id: ContactId) -> Result<()> {
+        lock(&self.inner.storage).delete_secret(&format!("keychanged:{}", id.0))?;
+        let _ = self.inner.events.send(MessengerEvent::ContactsChanged);
+        Ok(())
+    }
+
+    /// Whether encrypted backups are enabled.
+    #[must_use]
+    pub fn backup_enabled(&self) -> bool {
+        self.inner.flag(SECRET_BACKUP_KEY)
+    }
+
+    /// Enables encrypted backups with `password` (at least
+    /// [`MIN_PASSWORD_LEN`](crate::MIN_PASSWORD_LEN) characters) and uploads one now.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::Backup`] (password too short), registry or storage errors.
+    pub async fn set_backup_password(&self, password: &str) -> Result<()> {
+        self.registry()?;
+        let password = Zeroizing::new(password.to_owned());
+        let key = tokio::task::spawn_blocking(move || BackupKey::new(&password))
+            .await
+            .map_err(|_| MessagingError::Backup("interrupted"))??;
+        lock(&self.inner.storage).put_secret(SECRET_BACKUP_KEY, &key.to_bytes(), now_ms())?;
+        self.backup_now().await
+    }
+
+    /// Disables automatic backups on this device (the last backup stays on the server).
+    ///
+    /// # Errors
+    ///
+    /// Storage errors.
+    pub fn disable_backup(&self) -> Result<()> {
+        lock(&self.inner.storage).delete_secret(SECRET_BACKUP_KEY)?;
+        Ok(())
+    }
+
+    /// Uploads an encrypted backup now.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::Backup`] if backups are not enabled, registry or storage errors.
+    pub async fn backup_now(&self) -> Result<()> {
+        self.inner.backup_now().await
+    }
+
+    /// Restores contacts and history from the encrypted backup of this account (after recovery
+    /// or on a new device), and keeps backups enabled with the same password. Returns the number
+    /// of restored contacts.
+    ///
+    /// # Errors
+    ///
+    /// [`MessagingError::Backup`] (wrong password, no backup...), registry or storage errors.
+    pub async fn restore_backup(&self, password: &str) -> Result<usize> {
+        let blob = match self.registry()?.get_backup(&self.inner.device).await {
+            Err(ow_registry::RegistryError::NotFound) => {
+                return Err(MessagingError::Backup("no backup on the server"));
+            }
+            other => other?,
+        };
+        let password = Zeroizing::new(password.to_owned());
+        let (key, plain) = tokio::task::spawn_blocking(move || BackupKey::open(&password, &blob))
+            .await
+            .map_err(|_| MessagingError::Backup("interrupted"))??;
+        let data: BackupData = serde_json::from_slice(&plain)
+            .map_err(|_| MessagingError::Backup("unreadable content"))?;
+        let count = self.inner.import_backup(&data)?;
+        lock(&self.inner.storage).put_secret(SECRET_BACKUP_KEY, &key.to_bytes(), now_ms())?;
+        let _ = self.inner.events.send(MessengerEvent::ContactsChanged);
+        Inner::reconnect_all(Arc::clone(&self.inner)).await;
+        Ok(count)
+    }
+
     /// Stops the network node.
     pub async fn shutdown(&self) {
         self.inner.p2p.shutdown().await;
@@ -505,16 +855,274 @@ impl Inner {
                 .flatten()
                 .map(|b| decode_addrs(&b))
                 .unwrap_or_default();
-            lock(&self.net)
-                .addrs
-                .entry(peer)
-                .or_default()
-                .extend(saved.clone());
+            lock(&self.net).addrs.entry(peer).or_default().extend(saved);
+            let addrs = self.dial_addrs(peer);
             let p2p = self.p2p.clone();
             tokio::spawn(async move {
-                let _ = p2p.dial(peer, saved).await;
+                let _ = p2p.dial(peer, addrs).await;
             });
         }
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        lock(&self.storage)
+            .get_secret(name)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    fn spawn_name_check(self: &Arc<Self>, id: ContactId) {
+        if self.registry.is_none() {
+            return;
+        }
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = inner.check_name(id).await {
+                tracing::debug!(%e, contact = id.0, "username check postponed");
+            }
+        });
+    }
+
+    /// Confirms an announced username with the account server. If the server confirms it and
+    /// another contact had this name with older keys, that contact's keys changed: merge.
+    async fn check_name(self: &Arc<Self>, id: ContactId) -> Result<()> {
+        let Some(registry) = &self.registry else {
+            return Ok(());
+        };
+        let Some(contact) = lock(&self.storage).contact(id)? else {
+            return Ok(());
+        };
+        let Ok(handle) = Handle::new(&contact.handle) else {
+            return Ok(());
+        };
+        let found = match registry.lookup(&handle).await {
+            Ok(found) => found,
+            // Not discoverable or unknown: stays unconfirmed.
+            Err(ow_registry::RegistryError::NotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if found.master.to_bytes() != contact.master_pub {
+            // Someone announces a name that belongs to another identity: keep the warning.
+            tracing::warn!(
+                contact = id.0,
+                "announced username does not match the account server"
+            );
+            return Ok(());
+        }
+        let s = lock(&self.storage);
+        s.delete_secret(&format!("unconfirmed:{}", id.0))?;
+        let older = s.contacts()?.into_iter().find(|c| {
+            c.id != id && c.handle == contact.handle && c.master_pub != contact.master_pub
+        });
+        if let Some(old) = older {
+            s.merge_contact(id, old.id, &contact.master_pub)?;
+            s.put_secret(&format!("keychanged:{}", old.id.0), &[1], now_ms())?;
+            s.delete_secret(&format!("unconfirmed:{}", old.id.0))?;
+            drop(s);
+            let _ = self
+                .events
+                .send(MessengerEvent::KeyChanged { contact: old.id });
+        } else {
+            drop(s);
+        }
+        let _ = self.events.send(MessengerEvent::ContactsChanged);
+        Ok(())
+    }
+
+    /// At startup: re-check unconfirmed usernames (the server may have been unreachable).
+    async fn startup_checks(self: Arc<Self>) {
+        // Collect first: `flag` takes the storage lock again (std mutexes are not reentrant).
+        let contacts = lock(&self.storage).contacts().unwrap_or_default();
+        let ids: Vec<ContactId> = contacts
+            .into_iter()
+            .map(|c| c.id)
+            .filter(|id| self.flag(&format!("unconfirmed:{}", id.0)))
+            .collect();
+        for id in ids {
+            let _ = self.check_name(id).await;
+        }
+    }
+
+    /// Uploads a backup every [`BACKUP_INTERVAL`] when something changed.
+    async fn backup_loop(weak: std::sync::Weak<Self>) {
+        loop {
+            tokio::time::sleep(BACKUP_INTERVAL).await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner
+                .backup_dirty
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && inner.flag(SECRET_BACKUP_KEY)
+            {
+                match inner.backup_now().await {
+                    Ok(()) => tracing::debug!("automatic backup uploaded"),
+                    Err(e) => tracing::debug!(%e, "automatic backup postponed"),
+                }
+            }
+        }
+    }
+
+    /// Builds the backup content, shrinking the history until it fits the budget.
+    fn export_backup(&self) -> Result<Vec<u8>> {
+        let mut per_contact = 20_000u32;
+        loop {
+            let data = {
+                let s = lock(&self.storage);
+                let read_receipts = s
+                    .get_secret(SETTING_READ_RECEIPTS)?
+                    .is_none_or(|v| v.first() != Some(&0));
+                let mut contacts = Vec::new();
+                for c in s.contacts()? {
+                    let mut devices = Vec::new();
+                    for d in s.contact_devices(c.id)? {
+                        let Some(cert) = s.contact_device_cert(&d)? else {
+                            continue;
+                        };
+                        devices.push(BackupDevice {
+                            cert: b64(&cert),
+                            bundle: s.get_secret(&key_name("bundle", &d))?.map(|b| b64(&b)),
+                        });
+                    }
+                    let messages = s
+                        .contact_messages(c.id, per_contact)?
+                        .into_iter()
+                        .map(|m| BackupMessage {
+                            msg_id: b64(&m.msg_id),
+                            sender_device: b64(&m.sender_device),
+                            outgoing: m.outgoing,
+                            sent_at: m.sent_at,
+                            received_at: m.received_at,
+                            status: m.status as u8,
+                            body: m.body,
+                        })
+                        .collect();
+                    contacts.push(BackupContact {
+                        handle: c.handle,
+                        master_pub: b64(&c.master_pub),
+                        verified: c.verified,
+                        devices,
+                        messages,
+                    });
+                }
+                BackupData {
+                    version: 1,
+                    created_at: now_ms(),
+                    read_receipts,
+                    contacts,
+                }
+            };
+            let json = serde_json::to_vec(&data).map_err(|_| MessagingError::Backup("encoding"))?;
+            if json.len() <= BACKUP_BUDGET || per_contact <= 100 {
+                return Ok(json);
+            }
+            per_contact /= 2;
+        }
+    }
+
+    async fn backup_now(&self) -> Result<()> {
+        let registry = self.registry.as_ref().ok_or(MessagingError::NoRegistry)?;
+        let key = lock(&self.storage)
+            .get_secret(SECRET_BACKUP_KEY)?
+            .and_then(|b| BackupKey::from_bytes(&b))
+            .ok_or(MessagingError::Backup("backups are not enabled"))?;
+        self.backup_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let json = Zeroizing::new(self.export_backup()?);
+        let blob = key.seal(&json)?;
+        if let Err(e) = registry.put_backup(&self.device, blob).await {
+            self.backup_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Imports contacts and history. Existing data is kept (messages are deduplicated).
+    fn import_backup(&self, data: &BackupData) -> Result<usize> {
+        use base64::Engine;
+        let engine = &base64::engine::general_purpose::STANDARD;
+        let s = lock(&self.storage);
+        s.put_secret(
+            SETTING_READ_RECEIPTS,
+            &[u8::from(data.read_receipts)],
+            now_ms(),
+        )?;
+        let mut count = 0;
+        for c in &data.contacts {
+            let Some(master) = unb64::<32>(&c.master_pub) else {
+                continue;
+            };
+            if master == self.master.to_bytes() {
+                continue;
+            }
+            let id = s.upsert_contact(&NewContact {
+                master_pub: master,
+                handle: c.handle.clone(),
+                display_name: None,
+                added_at: now_ms(),
+            })?;
+            if c.verified {
+                s.set_contact_verified(id, true)?;
+            }
+            for d in &c.devices {
+                let Ok(cert_bytes) = engine.decode(&d.cert) else {
+                    continue;
+                };
+                // Only certificates of this contact's identity are restored.
+                let Ok(cert) = DeviceCertificate::from_bytes(&cert_bytes) else {
+                    continue;
+                };
+                if cert.master().to_bytes() != master {
+                    continue;
+                }
+                let device = cert.device().to_bytes();
+                s.add_contact_device(id, &device, &cert_bytes)?;
+                let bundle = d.bundle.as_deref().and_then(|b| engine.decode(b).ok());
+                if let Some(bundle) = bundle {
+                    if PrekeyBundle::from_bytes(&bundle, cert.device()).is_ok() {
+                        s.put_secret(&key_name("bundle", &device), &bundle, now_ms())?;
+                    }
+                }
+            }
+            let conv = s.dm_conversation(id, now_ms())?;
+            for m in &c.messages {
+                let (Some(msg_id), Some(sender)) =
+                    (unb64::<16>(&m.msg_id), unb64::<32>(&m.sender_device))
+                else {
+                    continue;
+                };
+                let status = match m.status {
+                    0 => MessageStatus::Pending,
+                    1 => MessageStatus::Sent,
+                    2 => MessageStatus::Delivered,
+                    3 => MessageStatus::Read,
+                    _ => MessageStatus::Received,
+                };
+                s.insert_message(&NewMessage {
+                    conversation: conv,
+                    msg_id,
+                    sender_device: sender,
+                    outgoing: m.outgoing,
+                    sent_at: m.sent_at,
+                    received_at: m.received_at,
+                    status,
+                    body: m.body.clone(),
+                })?;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Known direct addresses of `peer`, then circuits through our relays.
+    fn dial_addrs(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let mut addrs = lock(&self.net)
+            .addrs
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default();
+        addrs.extend(self.relays.iter().map(|r| circuit_addr(r, peer)));
+        addrs
     }
 
     fn contact_info(&self, c: ow_storage::Contact) -> Result<ContactInfo> {
@@ -536,6 +1144,8 @@ impl Inner {
             verified: c.verified,
             online,
             safety_number: safety,
+            key_changed: self.flag(&format!("keychanged:{}", c.id.0)),
+            name_unconfirmed: self.flag(&format!("unconfirmed:{}", c.id.0)),
         })
     }
 
@@ -575,7 +1185,6 @@ impl Inner {
 
     /// Encrypts a text frame for one device.
     fn encrypt_for(&self, device: &[u8; 32], message: &StoredMessage) -> Result<Vec<u8>> {
-        let dev = PublicKey::from_bytes(device)?;
         let (confirmed, bundle) = {
             let s = lock(&self.storage);
             (
@@ -595,7 +1204,17 @@ impl Inner {
             body: message.body.clone(),
         }
         .encode();
+        self.encrypt_payload(device, &frame, bundle)
+    }
 
+    /// Encrypts a frame for one device, starting a session from its bundle if needed.
+    fn encrypt_payload(
+        &self,
+        device: &[u8; 32],
+        frame: &[u8],
+        bundle: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        let dev = PublicKey::from_bytes(device)?;
         let mut crypto = lock(&self.crypto);
         let crypto = &mut *crypto;
         if !self.sessions(crypto, &dev).is_established() {
@@ -613,21 +1232,37 @@ impl Inner {
             .peers
             .get_mut(device)
             .ok_or(MessagingError::UnknownContact)?;
-        let envelope = peer.encrypt(&mut crypto.account, &self.device, &frame, now_s())?;
+        let envelope = peer.encrypt(&mut crypto.account, &self.device, frame, now_s())?;
         self.save_crypto(crypto, device)?;
         Ok(envelope.to_bytes())
     }
 
+    /// Starts delivering pending messages and receipts to `contact`. If a delivery is already
+    /// running, it runs one more pass when done (so nothing queued meanwhile is missed).
     fn spawn_delivery(self: &Arc<Self>, contact: ContactId) {
-        if !lock(&self.net).delivering.insert(contact.0) {
-            return; // Already in progress.
+        {
+            let mut net = lock(&self.net);
+            if let Some(rerun) = net.delivering.get_mut(&contact.0) {
+                *rerun = true;
+                return;
+            }
+            net.delivering.insert(contact.0, false);
         }
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = inner.deliver(contact).await {
-                tracing::debug!(%e, contact = contact.0, "delivery postponed");
+            loop {
+                if let Err(e) = inner.deliver(contact).await {
+                    tracing::debug!(%e, contact = contact.0, "delivery postponed");
+                }
+                let mut net = lock(&inner.net);
+                match net.delivering.get_mut(&contact.0) {
+                    Some(rerun) if *rerun => *rerun = false,
+                    _ => {
+                        net.delivering.remove(&contact.0);
+                        break;
+                    }
+                }
             }
-            lock(&inner.net).delivering.remove(&contact.0);
         });
     }
 
@@ -639,17 +1274,25 @@ impl Inner {
             let conv = s.dm_conversation(contact, now_ms())?;
             (s.contact_devices(contact)?, s.undelivered(conv)?)
         };
-        if pending.is_empty() {
+        let receipts_key = format!("receipts:{}", contact.0);
+        let receipts: Vec<[u8; 16]> = lock(&self.storage)
+            .get_secret(&receipts_key)?
+            .map(|b| {
+                b.chunks_exact(16)
+                    .map(|c| {
+                        let mut id = [0u8; 16];
+                        id.copy_from_slice(c);
+                        id
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() && receipts.is_empty() {
             return Ok(());
         }
         for device in devices {
             let peer = peer_id_of(&device)?;
-            let addrs = lock(&self.net)
-                .addrs
-                .get(&peer)
-                .cloned()
-                .unwrap_or_default();
-            self.p2p.dial(peer, addrs).await?;
+            self.p2p.dial(peer, self.dial_addrs(peer)).await?;
             for m in &pending {
                 let envelope = self.encrypt_for(&device, m)?;
                 let reply = self.p2p.send(peer, envelope).await?;
@@ -667,6 +1310,15 @@ impl Inner {
                     )));
                 }
             }
+            for chunk in receipts.chunks(MAX_RECEIPT_IDS) {
+                let bundle = lock(&self.storage).get_secret(&key_name("bundle", &device))?;
+                let envelope =
+                    self.encrypt_payload(&device, &Frame::encode_receipt(chunk), bundle)?;
+                self.p2p.send(peer, envelope).await?;
+            }
+        }
+        if !receipts.is_empty() {
+            lock(&self.storage).delete_secret(&receipts_key)?;
         }
         Ok(())
     }
@@ -685,8 +1337,30 @@ impl Inner {
             .get_mut(&device)
             .ok_or(MessagingError::UnknownContact)?;
         let plaintext = Zeroizing::new(peer.decrypt(&mut crypto.account, &envelope, &dev)?);
-        let frame = TextFrame::decode(&plaintext)?;
+        let frame = match Frame::decode(&plaintext)? {
+            Frame::Text(frame) => frame,
+            Frame::Receipt(ids) => {
+                let s = lock(&self.storage);
+                let contact = s
+                    .contact_by_device(&device)?
+                    .ok_or(MessagingError::UnknownContact)?
+                    .id;
+                drop(s);
+                self.save_crypto(crypto, &device)?;
+                let s = lock(&self.storage);
+                for msg_id in ids {
+                    s.advance_message_status(&msg_id, MessageStatus::Read)?;
+                    let _ = self.events.send(MessengerEvent::Status {
+                        contact,
+                        msg_id,
+                        status: MessageStatus::Read,
+                    });
+                }
+                return Ok(());
+            }
+        };
 
+        let mut new_from_intro = None;
         let s = lock(&self.storage);
         let contact = match s.contact_by_device(&device)? {
             Some(c) => c.id,
@@ -697,7 +1371,7 @@ impl Inner {
                 if cert.device() != &dev || cert.master().to_bytes() != intro.master_pub {
                     return Err(MessagingError::Crypto(ow_crypto::CryptoError::WrongDevice));
                 }
-                let handle = Handle::new(&intro.name, cert.master())?;
+                let handle = Handle::new(&intro.name)?;
                 let id = s.upsert_contact(&NewContact {
                     master_pub: intro.master_pub,
                     handle: handle.to_string(),
@@ -705,7 +1379,10 @@ impl Inner {
                     added_at: now_ms(),
                 })?;
                 s.add_contact_device(id, &device, &intro.cert)?;
+                // Announced by the sender: unconfirmed until the account server agrees.
+                s.put_secret(&format!("unconfirmed:{}", id.0), &[1], now_ms())?;
                 let _ = self.events.send(MessengerEvent::ContactsChanged);
+                new_from_intro = Some(id);
                 id
             }
         };
@@ -741,6 +1418,12 @@ impl Inner {
             let _ = self
                 .events
                 .send(MessengerEvent::Message { contact, message });
+        }
+        drop(s);
+        self.backup_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(id) = new_from_intro {
+            self.spawn_name_check(id);
         }
         Ok(())
     }
