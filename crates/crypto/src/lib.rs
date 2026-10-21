@@ -1,14 +1,36 @@
-//! End-to-end encryption: Signal Protocol (DMs) and MLS (groups).
+//! End-to-end encryption for OutpostWave direct messages.
 //!
-//! Status: skeleton (PoC roadmap step 0). The implementation will land in later steps.
+//! Built on **vodozemac** (Olm = Signal's Double Ratchet + triple Diffie-Hellman), with
+//! OutpostWave's trust chain on top:
+//!
+//! ```text
+//! master key ──signs──▶ device certificate ──▶ device key ──signs──▶ prekey bundle (Curve25519)
+//! ```
+//!
+//! - [`CryptoAccount`]: per-device Olm account. Publishes a signed [`PrekeyBundle`].
+//! - [`PeerSessions`]: Olm sessions with one remote device (handles simultaneous session setup).
+//! - [`Envelope`]: wire format of an encrypted message, carried by `/outpostwave/dm/1`.
+//!
+//! Group encryption (MLS) comes in roadmap step 4.
 
-/// Name of this crate, exposed for diagnostics and logs.
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+mod account;
+mod bundle;
+mod envelope;
+mod error;
+mod sessions;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_is_set() {
-        assert!(super::CRATE_NAME.starts_with("ow-"));
-    }
+pub use account::CryptoAccount;
+pub use bundle::{BUNDLE_LEN, KeyKind, PrekeyBundle};
+pub use envelope::{Envelope, EnvelopeKind};
+pub use error::CryptoError;
+pub use sessions::PeerSessions;
+
+/// Derives the key that encrypts pickled Olm state at rest (defence in depth on top of the
+/// encrypted database), from the device secret.
+#[must_use]
+pub fn pickle_key(device: &ow_identity::DeviceKey) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut secret = device.to_secret_bytes();
+    let key = blake3::derive_key("OutpostWave 2026-10 olm pickle key v1", &secret);
+    zeroize::Zeroize::zeroize(&mut secret);
+    zeroize::Zeroizing::new(key)
 }

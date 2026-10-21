@@ -13,4 +13,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-
+blake3 = "1.8"
+ow-identity = { path = "../identity" }
+# Olm: Signal's Double Ratchet with 3DH (Matrix implementation, audited, Apache-2.0).
+vodozemac = "0.11"
+zeroize = "1.9"
