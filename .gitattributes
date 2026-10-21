@@ -1,0 +1,6 @@
+# Normalize line endings: LF in the repo, required for reproducible builds.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+*.wasm binary

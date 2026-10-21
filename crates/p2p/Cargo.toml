@@ -1,0 +1,16 @@
+[package]
+name = "ow-p2p"
+description = "P2P transport: libp2p, DHT, QUIC, hole punching, relays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+

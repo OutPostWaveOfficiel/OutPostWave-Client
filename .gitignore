@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Secrets and local config — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri
+app/src-tauri/gen/schemas/
+app/src-tauri/gen/android/
+app/src-tauri/gen/apple/
+
+# Local Windows launcher (personal, not versioned)
+/run.cmd

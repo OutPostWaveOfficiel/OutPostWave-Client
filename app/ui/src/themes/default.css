@@ -1,0 +1,36 @@
+/* Default theme. Themes only override these custom properties. */
+:root {
+  --ow-bg: #f6f7f9;
+  --ow-fg: #16181d;
+  --ow-muted: #5c6370;
+  --ow-accent: #2f7cf6;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ow-bg: #111317;
+    --ow-fg: #e6e8eb;
+    --ow-muted: #9aa1ac;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ow-bg);
+  color: var(--ow-fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+#app {
+  display: grid;
+  place-content: center;
+  height: 100%;
+  text-align: center;
+}
+
+.muted {
+  color: var(--ow-muted);
+}

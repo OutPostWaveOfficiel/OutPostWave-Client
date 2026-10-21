@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/identity",
+    "crates/crypto",
+    "crates/p2p",
+    "crates/messaging",
+    "crates/files",
+    "crates/voice",
+    "crates/video",
+    "crates/screenshare",
+    "crates/plugins",
+    "crates/presence",
+    "crates/mumblelink",
+    "crates/storage",
+    "crates/search",
+    "crates/antispam",
+    "app/src-tauri",
+]
+default-members = ["crates/identity", "crates/crypto", "crates/p2p", "crates/messaging", "crates/files", "crates/voice", "crates/video", "crates/screenshare", "crates/plugins", "crates/presence", "crates/mumblelink", "crates/storage", "crates/search", "crates/antispam", "app/src-tauri"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/OutPostWaveOfficiel/OutPostWave-Client"
+authors = ["OutpostWave contributors"]
+publish = false
+
+[workspace.dependencies]
+
+[workspace.lints.rust]
+# FFI crates (capture, hardware codecs, shared memory) may opt in locally with #![allow(unsafe_code)].
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+# Small, fast binaries: performance is a core goal.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev.package."*"]
+# Optimize dependencies in dev builds (audio/video code is unusable unoptimized).
+opt-level = 2

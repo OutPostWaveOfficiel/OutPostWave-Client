@@ -1,0 +1,5 @@
+# Pinned toolchain for reproducible builds. Bump deliberately, in a dedicated PR.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

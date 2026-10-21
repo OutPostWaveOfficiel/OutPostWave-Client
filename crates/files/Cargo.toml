@@ -1,0 +1,16 @@
+[package]
+name = "ow-files"
+description = "P2P file transfer: BLAKE3 chunks, resume, swarm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
