@@ -17,7 +17,7 @@ mod store;
 pub use error::StorageError;
 pub use key::DbKey;
 pub use model::{
-    Contact, ContactId, ConversationId, LocalIdentity, MessageStatus, NewContact, NewMessage,
-    StoredMessage,
+    Contact, ContactId, ConversationId, FileRow, FileState, LocalIdentity, MessageStatus,
+    NewContact, NewMessage, StoredMessage,
 };
 pub use store::Storage;

@@ -6,7 +6,7 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{StreamProtocol, dcutr, identify, identity, kad, mdns, ping, relay, request_response};
 
-use crate::codec::{BytesCodec, DM_PROTOCOL};
+use crate::codec::{BytesCodec, DM_PROTOCOL, FILE_PROTOCOL};
 
 /// OutpostWave DHT protocol (kept separate from the public IPFS DHT).
 const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/outpostwave/kad/1");
@@ -24,6 +24,15 @@ pub(crate) struct Behaviour {
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub dm: request_response::Behaviour<BytesCodec>,
+    pub file: request_response::Behaviour<BytesCodec>,
+}
+
+/// Relay server settings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelayServer {
+    pub enabled: bool,
+    pub max_circuit_bytes: u64,
+    pub max_circuit_duration: Duration,
 }
 
 impl Behaviour {
@@ -31,7 +40,7 @@ impl Behaviour {
         key: &identity::Keypair,
         relay: relay::client::Behaviour,
         enable_mdns: bool,
-        relay_server: bool,
+        relay_server: RelayServer,
     ) -> std::io::Result<Self> {
         let peer_id = key.public().to_peer_id();
         let identify = identify::Behaviour::new(
@@ -52,20 +61,28 @@ impl Behaviour {
             None
         };
         let dm = request_response::Behaviour::with_codec(
-            BytesCodec,
+            BytesCodec::DM,
             [(DM_PROTOCOL, request_response::ProtocolSupport::Full)],
             request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
         );
-        // Relay limits: long enough for messages and file chunks; DCUtR upgrades to direct.
-        let relay_server = relay_server.then(|| {
+        // Many chunk requests run in parallel; a chunk may take a while on a slow uplink.
+        let file = request_response::Behaviour::with_codec(
+            BytesCodec::FILE,
+            [(FILE_PROTOCOL, request_response::ProtocolSupport::Full)],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(90))
+                .with_max_concurrent_streams(256),
+        );
+        // DCUtR upgrades relayed connections to direct ones when hole punching works.
+        let relay_server = relay_server.enabled.then(|| {
             relay::Behaviour::new(
                 peer_id,
                 relay::Config {
                     max_reservations: 4096,
                     max_circuits: 4096,
                     max_circuits_per_peer: 16,
-                    max_circuit_duration: Duration::from_secs(30 * 60),
-                    max_circuit_bytes: 64 * 1024 * 1024,
+                    max_circuit_duration: relay_server.max_circuit_duration,
+                    max_circuit_bytes: relay_server.max_circuit_bytes,
                     ..relay::Config::default()
                 },
             )
@@ -79,6 +96,7 @@ impl Behaviour {
             kad,
             mdns: mdns.into(),
             dm,
+            file,
         })
     }
 }

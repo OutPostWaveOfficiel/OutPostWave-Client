@@ -23,6 +23,19 @@ export interface Contact {
   unread: number;
 }
 
+export type FileState = "offered" | "downloading" | "paused" | "waiting" | "complete" | "failed";
+
+export interface FileTransfer {
+  fileId: string;
+  name: string;
+  size: number;
+  outgoing: boolean;
+  state: FileState;
+  bytes: number;
+  rate: number;
+  openable: boolean;
+}
+
 export type MessageStatus = "pending" | "sent" | "delivered" | "read" | "received";
 
 export interface Message {
@@ -32,6 +45,7 @@ export interface Message {
   sentAt: number;
   status: MessageStatus;
   body: string;
+  file: FileTransfer | null;
 }
 
 export interface Settings {
@@ -57,6 +71,7 @@ export type OwEvent =
   | { type: "presence"; contact: number; online: boolean }
   | { type: "keyChanged"; contact: number }
   | { type: "contactRequest"; contact: number }
+  | { type: "file"; contact: number; file: FileTransfer }
   | { type: "resync" };
 
 export const api = {
@@ -83,6 +98,12 @@ export const api = {
   setBadge: (count: number, overlay: number[] | null) => invoke<void>("set_badge", { count, overlay }),
   requestAttention: () => invoke<void>("request_attention"),
   setServer: (host: string | null) => invoke<void>("set_server", { host }),
+  sendFiles: (contact: number, paths: string[]) => invoke<void>("send_files", { contact, paths }),
+  pickAndSendFiles: (contact: number) => invoke<void>("pick_and_send_files", { contact }),
+  downloadFile: (file: string) => invoke<void>("download_file", { file }),
+  pauseFile: (file: string) => invoke<void>("pause_file", { file }),
+  cancelFile: (file: string) => invoke<void>("cancel_file", { file }),
+  openFile: (file: string, reveal: boolean) => invoke<void>("open_file", { file, reveal }),
   getPrefs: () => invoke<{ sounds: boolean }>("get_prefs"),
   setEmail: (email: string) => invoke<void>("set_email", { email }),
   verifyEmail: (code: string) => invoke<void>("verify_email", { code }),

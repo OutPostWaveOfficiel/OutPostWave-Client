@@ -11,12 +11,16 @@
 //! ```
 //!
 //! Read receipt (kind 2): `version | kind | count u16 BE | msg_id 16 × count`.
+//!
+//! File offer (kind 3): like text, with `file_id 32 | size u64 BE | file_key 32` before the body,
+//! which holds the file name. See `spec/v0/files.md`.
 
 use crate::MessagingError;
 
 const VERSION: u8 = 1;
 const KIND_TEXT: u8 = 1;
 const KIND_RECEIPT: u8 = 2;
+const KIND_FILE: u8 = 3;
 /// Maximum number of message ids in one read receipt.
 pub(crate) const MAX_RECEIPT_IDS: usize = 512;
 const FLAG_INTRO: u8 = 1;
@@ -31,19 +35,41 @@ pub(crate) struct Intro {
     pub cert: Vec<u8>,
 }
 
+/// File attached to a message (the body is the file name).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FileRef {
+    pub file_id: [u8; 32],
+    pub size: u64,
+    pub key: [u8; 32],
+}
+
+impl core::fmt::Debug for FileRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "FileRef({} bytes)", self.size)
+    }
+}
+
 /// Text message frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextFrame {
     pub msg_id: [u8; 16],
     pub sent_at: i64,
     pub intro: Option<Intro>,
+    pub file: Option<FileRef>,
     pub body: String,
 }
 
 impl TextFrame {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(27 + self.body.len());
-        out.extend_from_slice(&[VERSION, KIND_TEXT]);
+        out.extend_from_slice(&[
+            VERSION,
+            if self.file.is_some() {
+                KIND_FILE
+            } else {
+                KIND_TEXT
+            },
+        ]);
         out.extend_from_slice(&self.msg_id);
         out.extend_from_slice(&self.sent_at.to_be_bytes());
         match &self.intro {
@@ -56,6 +82,11 @@ impl TextFrame {
                 out.extend_from_slice(&i.cert);
             }
             None => out.push(0),
+        }
+        if let Some(f) = &self.file {
+            out.extend_from_slice(&f.file_id);
+            out.extend_from_slice(&f.size.to_be_bytes());
+            out.extend_from_slice(&f.key);
         }
         out.extend_from_slice(self.body.as_bytes());
         out
@@ -73,9 +104,10 @@ impl TextFrame {
         };
         let mut b = b;
         let head = take(&mut b, 2)?;
-        if head != [VERSION, KIND_TEXT] {
+        if head != [VERSION, KIND_TEXT] && head != [VERSION, KIND_FILE] {
             return Err(bad());
         }
+        let is_file = head[1] == KIND_FILE;
         let mut msg_id = [0u8; 16];
         msg_id.copy_from_slice(&take(&mut b, 16)?);
         let mut ts = [0u8; 8];
@@ -96,6 +128,21 @@ impl TextFrame {
         } else {
             None
         };
+        let file = if is_file {
+            let mut file_id = [0u8; 32];
+            file_id.copy_from_slice(&take(&mut b, 32)?);
+            let mut size = [0u8; 8];
+            size.copy_from_slice(&take(&mut b, 8)?);
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&take(&mut b, 32)?);
+            Some(FileRef {
+                file_id,
+                size: u64::from_be_bytes(size),
+                key,
+            })
+        } else {
+            None
+        };
         if b.len() > MAX_TEXT_LEN {
             return Err(bad());
         }
@@ -104,6 +151,7 @@ impl TextFrame {
             msg_id,
             sent_at: i64::from_be_bytes(ts),
             intro,
+            file,
             body,
         })
     }
@@ -132,7 +180,7 @@ impl Frame {
     pub(crate) fn decode(b: &[u8]) -> Result<Self, MessagingError> {
         let bad = || MessagingError::Crypto(ow_crypto::CryptoError::Malformed);
         match b {
-            [VERSION, KIND_TEXT, ..] => TextFrame::decode(b).map(Self::Text),
+            [VERSION, KIND_TEXT | KIND_FILE, ..] => TextFrame::decode(b).map(Self::Text),
             [VERSION, KIND_RECEIPT, c0, c1, rest @ ..] => {
                 let count = usize::from(u16::from_be_bytes([*c0, *c1]));
                 if count > MAX_RECEIPT_IDS || rest.len() != count * 16 {
@@ -155,7 +203,7 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, Intro, TextFrame};
+    use super::{FileRef, Frame, Intro, TextFrame};
 
     #[test]
     fn receipt_roundtrip() {
@@ -177,13 +225,23 @@ mod tests {
                 cert: vec![9; 150],
             }),
         ] {
-            let f = TextFrame {
-                msg_id: [7; 16],
-                sent_at: -5,
-                intro,
-                body: "héllo 👋".into(),
-            };
-            assert_eq!(TextFrame::decode(&f.encode()).unwrap(), f);
+            for file in [
+                None,
+                Some(FileRef {
+                    file_id: [4; 32],
+                    size: 1 << 40,
+                    key: [5; 32],
+                }),
+            ] {
+                let f = TextFrame {
+                    msg_id: [7; 16],
+                    sent_at: -5,
+                    intro: intro.clone(),
+                    file,
+                    body: "héllo 👋".into(),
+                };
+                assert_eq!(TextFrame::decode(&f.encode()).unwrap(), f);
+            }
         }
         assert!(TextFrame::decode(&[1, 1, 0]).is_err());
     }

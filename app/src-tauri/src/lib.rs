@@ -94,12 +94,16 @@ impl AppState {
         let relays = server.relays;
         let (messenger, mut rx) =
             Messenger::start(storage, server.registry, |cfg| cfg.relays = relays).map_err(err)?;
+        if let Ok(dir) = app.path().download_dir() {
+            messenger.set_download_dir(dir.join("OutpostWave"));
+        }
         let app = app.clone();
+        let m = messenger.clone();
         tauri::async_runtime::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        let _ = app.emit("ow-event", EventDto::from(event));
+                        let _ = app.emit("ow-event", EventDto::new(event, &m));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // The UI reloads its lists on this event.
@@ -314,11 +318,9 @@ async fn list_messages(
     contact: i64,
     before: Option<i64>,
 ) -> CmdResult<Vec<MessageDto>> {
-    let list = messenger(&state)
-        .await?
-        .messages(ContactId(contact), before, PAGE)
-        .map_err(err)?;
-    Ok(list.iter().map(MessageDto::from).collect())
+    let m = messenger(&state).await?;
+    let list = m.messages(ContactId(contact), before, PAGE).map_err(err)?;
+    Ok(list.iter().map(|x| MessageDto::new(x, &m)).collect())
 }
 
 /// Sends a text message.
@@ -328,11 +330,105 @@ async fn send_message(
     contact: i64,
     text: String,
 ) -> CmdResult<MessageDto> {
-    let m = messenger(&state)
-        .await?
+    let messenger = messenger(&state).await?;
+    let m = messenger
         .send_text(ContactId(contact), &text)
         .map_err(err)?;
-    Ok(MessageDto::from(&m))
+    Ok(MessageDto::new(&m, &messenger))
+}
+
+fn file_id(id: &str) -> CmdResult<[u8; 32]> {
+    dto::unhex32(id).ok_or_else(|| "invalid file id".to_owned())
+}
+
+/// Offers files to a contact (paths from drag and drop). Files are prepared one after another.
+#[tauri::command]
+async fn send_files(state: State<'_, AppState>, contact: i64, paths: Vec<String>) -> CmdResult<()> {
+    let m = messenger(&state).await?;
+    for p in paths {
+        m.send_file(ContactId(contact), std::path::Path::new(&p))
+            .await
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Opens the system file picker, then offers the chosen files to a contact.
+#[tauri::command]
+async fn pick_and_send_files(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact: i64,
+) -> CmdResult<()> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_files())
+            .await
+            .map_err(err)?;
+    let Some(files) = picked else { return Ok(()) };
+    let paths = files
+        .into_iter()
+        .filter_map(|f| f.into_path().ok())
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect();
+    send_files(state, contact, paths).await
+}
+
+/// Starts or resumes a download into the download folder.
+#[tauri::command]
+async fn download_file(state: State<'_, AppState>, file: String) -> CmdResult<()> {
+    messenger(&state)
+        .await?
+        .download_file(&file_id(&file)?, None)
+        .map_err(err)
+}
+
+/// Pauses a download.
+#[tauri::command]
+async fn pause_file(state: State<'_, AppState>, file: String) -> CmdResult<()> {
+    messenger(&state)
+        .await?
+        .pause_file(&file_id(&file)?)
+        .map_err(err)
+}
+
+/// Cancels a transfer.
+#[tauri::command]
+async fn cancel_file(state: State<'_, AppState>, file: String) -> CmdResult<()> {
+    messenger(&state)
+        .await?
+        .cancel_file(&file_id(&file)?)
+        .map_err(err)
+}
+
+/// Extensions that can run code when opened: shown in their folder instead of being opened.
+const RISKY: &[&str] = &[
+    "exe", "msi", "bat", "cmd", "com", "scr", "pif", "ps1", "psm1", "vbs", "vbe", "js", "jse",
+    "wsf", "wsh", "hta", "lnk", "reg", "jar", "app", "command", "sh", "run", "appimage", "deb",
+    "rpm", "dmg", "pkg", "apk", "msix", "appx", "cpl", "dll", "sys",
+];
+
+/// Opens a received (or sent) file with its default application. Potentially executable files
+/// are shown in their folder instead.
+#[tauri::command]
+async fn open_file(state: State<'_, AppState>, file: String, reveal: bool) -> CmdResult<()> {
+    let info = messenger(&state)
+        .await?
+        .file(&file_id(&file)?)
+        .map_err(err)?;
+    let path = info
+        .path
+        .filter(|p| p.exists())
+        .ok_or_else(|| "file not found".to_owned())?;
+    let risky = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| RISKY.contains(&e.to_ascii_lowercase().as_str()));
+    if reveal || risky {
+        tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
+    } else {
+        tauri_plugin_opener::open_path(&path, None::<&str>).map_err(err)
+    }
 }
 
 /// Marks the conversation as read (sends read receipts if enabled).
@@ -599,6 +695,8 @@ fn profile_name() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Native file picker, used from Rust only (no permission granted to the webview).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let profile = profile_name();
             let data_dir = app.path().app_data_dir()?.join("profiles").join(&profile);
@@ -647,7 +745,13 @@ pub fn run() {
             set_badge,
             request_attention,
             set_server,
-            get_prefs
+            get_prefs,
+            send_files,
+            pick_and_send_files,
+            download_file,
+            pause_file,
+            cancel_file,
+            open_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to start OutpostWave");

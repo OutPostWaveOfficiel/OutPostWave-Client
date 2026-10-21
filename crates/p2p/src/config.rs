@@ -24,6 +24,11 @@ pub struct P2pConfig {
     pub relays: Vec<Multiaddr>,
     /// Act as a relay for other peers (official relays, or group members for mesh routing).
     pub relay_server: bool,
+    /// Relay server: maximum bytes per circuit (`0` = unlimited).
+    pub relay_max_circuit_bytes: u64,
+    /// Relay server: maximum duration of a circuit.
+    #[zeroize(skip)]
+    pub relay_max_circuit_duration: std::time::Duration,
     /// Publicly reachable addresses of this node (needed by relays).
     #[zeroize(skip)]
     pub external_addrs: Vec<Multiaddr>,
@@ -50,6 +55,8 @@ impl P2pConfig {
             bootstrap: Vec::new(),
             relays: Vec::new(),
             relay_server: false,
+            relay_max_circuit_bytes: 0,
+            relay_max_circuit_duration: std::time::Duration::from_secs(12 * 3600),
             external_addrs: Vec::new(),
         }
     }

@@ -57,6 +57,26 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         updated_at      INTEGER NOT NULL
     ) STRICT;
     ",
+    // v2: file transfers.
+    r"
+    ALTER TABLE messages ADD COLUMN file_id BLOB CHECK (file_id IS NULL OR length(file_id) = 32);
+
+    CREATE TABLE files (
+        file_id         BLOB PRIMARY KEY CHECK (length(file_id) = 32),
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        outgoing        INTEGER NOT NULL CHECK (outgoing IN (0, 1)),
+        name            TEXT NOT NULL,
+        size            INTEGER NOT NULL,
+        file_key        BLOB NOT NULL CHECK (length(file_key) = 32),
+        source_device   BLOB NOT NULL CHECK (length(source_device) = 32),
+        manifest        BLOB,
+        path            TEXT,
+        bitmap          BLOB,
+        state           INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX files_by_state ON files(state);
+    ",
 ];
 
 /// Latest schema version.

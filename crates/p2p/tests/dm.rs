@@ -151,3 +151,36 @@ async fn dm_through_relay() {
         .unwrap();
     assert_eq!(reply, b"via relay");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_protocol_large_responses() {
+    let (a, mut a_events) = node(21, "/ip4/127.0.0.1/udp/0/quic-v1");
+    let (b, mut b_events) = node(22, "/ip4/127.0.0.1/udp/0/quic-v1");
+    let b_addr = first_listen_addr(&mut b_events).await;
+    tokio::spawn(async move { while a_events.recv().await.is_some() {} });
+    let b2 = b.clone();
+    tokio::spawn(async move {
+        while let Some(e) = b_events.recv().await {
+            if let P2pEvent::FileRequest { payload, token, .. } = e {
+                // Answers with a full 1 MiB "chunk".
+                let b3 = b2.clone();
+                tokio::spawn(async move {
+                    b3.file_reply(token, vec![payload[0]; 1024 * 1024])
+                        .await
+                        .unwrap();
+                });
+            }
+        }
+    });
+    timeout(T, a.dial(b.peer_id(), vec![b_addr]))
+        .await
+        .unwrap()
+        .unwrap();
+    let reqs = (0..16u8).map(|i| a.file_request(b.peer_id(), vec![i]));
+    let replies = timeout(T, futures::future::join_all(reqs)).await.unwrap();
+    for (i, r) in replies.into_iter().enumerate() {
+        let r = r.unwrap();
+        assert_eq!(r.len(), 1024 * 1024);
+        assert_eq!(usize::from(r[0]), i);
+    }
+}

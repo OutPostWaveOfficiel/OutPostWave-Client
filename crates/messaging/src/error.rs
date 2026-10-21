@@ -19,6 +19,10 @@ pub enum MessagingError {
     InvalidText,
     /// Backup error.
     Backup(&'static str),
+    /// Unknown file transfer.
+    UnknownFile,
+    /// File system error (file transfers).
+    Io(String),
     /// No account server configured.
     NoRegistry,
     /// Account server error.
@@ -43,6 +47,8 @@ impl fmt::Display for MessagingError {
             Self::UnknownContact => f.write_str("unknown contact"),
             Self::InvalidText => f.write_str("message is empty or too long"),
             Self::Backup(e) => write!(f, "backup: {e}"),
+            Self::UnknownFile => f.write_str("unknown file"),
+            Self::Io(e) => write!(f, "file: {e}"),
             Self::NoRegistry => f.write_str("no account server configured"),
             Self::Registry(e) => write!(f, "{e}"),
             Self::Identity(e) => write!(f, "{e}"),

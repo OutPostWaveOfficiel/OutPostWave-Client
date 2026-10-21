@@ -19,8 +19,11 @@ use tokio::sync::{broadcast, mpsc};
 use zeroize::Zeroizing;
 
 use crate::backup::{BackupContact, BackupData, BackupDevice, BackupKey, BackupMessage};
-use crate::wire::{Frame, Intro, MAX_RECEIPT_IDS, MAX_TEXT_LEN, TextFrame};
+use crate::wire::{FileRef, Frame, Intro, MAX_RECEIPT_IDS, MAX_TEXT_LEN, TextFrame};
+
+mod transfers;
 use crate::{Invite, MessagingError, base32};
+pub use transfers::{AUTO_DOWNLOAD_MAX, FileInfo};
 
 type Result<T> = core::result::Result<T, MessagingError>;
 
@@ -284,6 +287,13 @@ pub enum MessengerEvent {
         /// Contact.
         contact: ContactId,
     },
+    /// A file transfer progressed or changed state.
+    File {
+        /// Contact of the conversation.
+        contact: ContactId,
+        /// Transfer.
+        file: FileInfo,
+    },
     /// A contact came online or went offline.
     Presence {
         /// Contact.
@@ -323,6 +333,7 @@ struct Inner {
     /// Relays we hold a reservation on; contacts are tried through them too.
     relays: Vec<Multiaddr>,
     events: broadcast::Sender<MessengerEvent>,
+    transfers: Mutex<transfers::Transfers>,
 }
 
 /// Running messenger. Cheap to clone.
@@ -396,11 +407,14 @@ impl Messenger {
             backup_dirty: std::sync::atomic::AtomicBool::new(false),
             relays,
             events,
+            transfers: Mutex::new(transfers::Transfers::default()),
         });
         inner.save_account()?;
         tokio::spawn(Inner::event_loop(Arc::clone(&inner), p2p_events));
         tokio::spawn(Inner::reconnect_all(Arc::clone(&inner)));
         tokio::spawn(Inner::startup_checks(Arc::clone(&inner)));
+        // Downloads interrupted by the last shutdown.
+        Inner::resume_downloads(&inner, None);
         tokio::spawn(Inner::backup_loop(Arc::downgrade(&inner)));
         Ok((Self { inner }, rx))
     }
@@ -651,6 +665,7 @@ impl Messenger {
                 received_at: None,
                 status: MessageStatus::Pending,
                 body: text.to_owned(),
+                file_id: None,
             };
             let id = s.insert_message(&new)?.unwrap_or_default();
             StoredMessage {
@@ -663,6 +678,7 @@ impl Messenger {
                 received_at: None,
                 status: MessageStatus::Pending,
                 body: new.body,
+                file_id: None,
             }
         };
         let _ = inner.events.send(MessengerEvent::Message {
@@ -1192,6 +1208,7 @@ impl Inner {
                     received_at: m.received_at,
                     status,
                     body: m.body.clone(),
+                    file_id: None,
                 })?;
             }
             count += 1;
@@ -1283,10 +1300,24 @@ impl Inner {
             master_pub: self.master.to_bytes(),
             cert: self.cert.to_bytes(),
         });
+        let file = match &message.file_id {
+            Some(id) => {
+                let row = lock(&self.storage)
+                    .file(id)?
+                    .ok_or(MessagingError::UnknownFile)?;
+                Some(FileRef {
+                    file_id: row.file_id,
+                    size: row.size,
+                    key: row.key,
+                })
+            }
+            None => None,
+        };
         let frame = TextFrame {
             msg_id: message.msg_id,
             sent_at: message.sent_at,
             intro,
+            file,
             body: message.body.clone(),
         }
         .encode();
@@ -1481,6 +1512,11 @@ impl Inner {
         let s = lock(&self.storage);
         s.put_secret(&key_name("confirmed", &device), &[1], now_ms())?;
         let conv = s.dm_conversation(contact, now_ms())?;
+        // A file offer: the body is the file name, made safe before it touches the disk.
+        let body = match &frame.file {
+            Some(_) => ow_files::safe_file_name(&frame.body),
+            None => frame.body,
+        };
         let new = NewMessage {
             conversation: conv,
             msg_id: frame.msg_id,
@@ -1489,8 +1525,10 @@ impl Inner {
             sent_at: frame.sent_at,
             received_at: Some(now_ms()),
             status: MessageStatus::Received,
-            body: frame.body,
+            body,
+            file_id: frame.file.as_ref().map(|f| f.file_id),
         };
+        let offer = frame.file.clone();
         if let Some(id) = s.insert_message(&new)? {
             let message = StoredMessage {
                 id,
@@ -1502,12 +1540,18 @@ impl Inner {
                 received_at: new.received_at,
                 status: MessageStatus::Received,
                 body: new.body,
+                file_id: new.file_id,
             };
+            drop(s);
+            if let Some(f) = &offer {
+                self.on_offer(conv, device, f, &message.body)?;
+            }
             let _ = self
                 .events
                 .send(MessengerEvent::Message { contact, message });
+        } else {
+            drop(s);
         }
-        drop(s);
         self.backup_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(id) = new_from_intro {
@@ -1560,8 +1604,14 @@ impl Inner {
                             online: true,
                         });
                         self.spawn_delivery(contact);
+                        self.resume_downloads(Some(contact));
                     }
                 }
+                P2pEvent::FileRequest {
+                    from,
+                    payload,
+                    token,
+                } => self.serve(from, payload, token),
                 P2pEvent::PeerDisconnected(peer) => {
                     lock(&self.net).online.remove(&peer);
                     if let Some(contact) = self.contact_of_peer(&peer) {

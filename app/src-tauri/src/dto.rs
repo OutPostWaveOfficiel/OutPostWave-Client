@@ -1,9 +1,11 @@
 //! Serializable types sent to the UI (camelCase JSON).
 
-use ow_messaging::{ContactInfo, MessageStatus, MessengerEvent, StoredMessage};
+use ow_messaging::{
+    ContactInfo, FileInfo, FileState, MessageStatus, Messenger, MessengerEvent, StoredMessage,
+};
 use serde::Serialize;
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
         .iter()
@@ -20,6 +22,59 @@ fn status(s: MessageStatus) -> &'static str {
         MessageStatus::Delivered => "delivered",
         MessageStatus::Read => "read",
         MessageStatus::Received => "received",
+    }
+}
+
+/// Parses a 32-byte id in hex.
+pub(crate) fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn file_state(s: FileState) -> &'static str {
+    match s {
+        FileState::Offered => "offered",
+        FileState::Downloading => "downloading",
+        FileState::Paused => "paused",
+        FileState::Waiting => "waiting",
+        FileState::Complete => "complete",
+        FileState::Failed => "failed",
+    }
+}
+
+/// File transfer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDto {
+    file_id: String,
+    name: String,
+    size: u64,
+    outgoing: bool,
+    state: &'static str,
+    bytes: u64,
+    rate: f64,
+    /// A local file can be opened (complete download, or our original).
+    openable: bool,
+}
+
+impl From<FileInfo> for FileDto {
+    fn from(f: FileInfo) -> Self {
+        Self {
+            file_id: hex(&f.file_id),
+            name: f.name,
+            size: f.size,
+            outgoing: f.outgoing,
+            state: file_state(f.state),
+            bytes: f.bytes,
+            rate: f.rate,
+            openable: f.path.is_some_and(|p| p.exists()),
+        }
     }
 }
 
@@ -76,10 +131,12 @@ pub struct MessageDto {
     sent_at: i64,
     status: &'static str,
     body: String,
+    file: Option<FileDto>,
 }
 
-impl From<&StoredMessage> for MessageDto {
-    fn from(m: &StoredMessage) -> Self {
+impl MessageDto {
+    /// Message with its attached file, if any.
+    pub fn new(m: &StoredMessage, messenger: &Messenger) -> Self {
         Self {
             id: m.id,
             msg_id: hex(&m.msg_id),
@@ -87,6 +144,10 @@ impl From<&StoredMessage> for MessageDto {
             sent_at: m.sent_at,
             status: status(m.status),
             body: m.body.clone(),
+            file: m
+                .file_id
+                .and_then(|id| messenger.file(&id).ok())
+                .map(FileDto::from),
         }
     }
 }
@@ -115,16 +176,23 @@ pub enum EventDto {
     KeyChanged { contact: i64 },
     /// Someone unknown wrote to us.
     ContactRequest { contact: i64 },
+    /// File transfer progress or state change.
+    File { contact: i64, file: FileDto },
     /// Events were lost: reload everything.
     Resync,
 }
 
-impl From<MessengerEvent> for EventDto {
-    fn from(e: MessengerEvent) -> Self {
+impl EventDto {
+    /// Converts a messenger event.
+    pub fn new(e: MessengerEvent, messenger: &Messenger) -> Self {
         match e {
             MessengerEvent::Message { contact, message } => Self::Message {
                 contact: contact.0,
-                message: MessageDto::from(&message),
+                message: MessageDto::new(&message, messenger),
+            },
+            MessengerEvent::File { contact, file } => Self::File {
+                contact: contact.0,
+                file: FileDto::from(file),
             },
             MessengerEvent::Status {
                 contact,

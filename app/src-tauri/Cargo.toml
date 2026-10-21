@@ -30,3 +30,5 @@ ow-p2p = { path = "../../crates/p2p" }
 ow-storage = { path = "../../crates/storage", features = ["os-keystore"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tokio = { version = "1", features = ["sync"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"

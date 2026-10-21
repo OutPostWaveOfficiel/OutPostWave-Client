@@ -7,8 +7,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::migrations::{MIGRATIONS, latest};
 use crate::{
-    Contact, ContactId, ConversationId, DbKey, LocalIdentity, MessageStatus, NewContact,
-    NewMessage, StorageError, StoredMessage,
+    Contact, ContactId, ConversationId, DbKey, FileRow, FileState, LocalIdentity, MessageStatus,
+    NewContact, NewMessage, StorageError, StoredMessage,
 };
 
 type Result<T> = core::result::Result<T, StorageError>;
@@ -403,8 +403,8 @@ impl Storage {
             .conn
             .query_row(
                 "INSERT INTO messages (conversation_id, msg_id, sender_device, outgoing, sent_at,
-                                       received_at, status, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                       received_at, status, body, file_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (msg_id) DO NOTHING
                  RETURNING id",
                 params![
@@ -415,7 +415,8 @@ impl Storage {
                     m.sent_at,
                     m.received_at,
                     m.status as i64,
-                    m.body
+                    m.body,
+                    m.file_id.as_ref().map(<[u8; 32]>::as_slice)
                 ],
                 |r| r.get(0),
             )
@@ -436,7 +437,7 @@ impl Storage {
     ) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
-                    status, body
+                    status, body, file_id
              FROM messages
              WHERE conversation_id = ?1 AND id < ?2
              ORDER BY sent_at DESC, id DESC
@@ -457,7 +458,7 @@ impl Storage {
     pub fn contact_messages(&self, contact: ContactId, limit: u32) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT m.id, m.conversation_id, m.msg_id, m.sender_device, m.outgoing, m.sent_at,
-                    m.received_at, m.status, m.body
+                    m.received_at, m.status, m.body, m.file_id
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              WHERE c.contact_id = ?1
              ORDER BY m.sent_at DESC, m.id DESC
@@ -475,13 +476,122 @@ impl Storage {
     pub fn undelivered(&self, conversation: ConversationId) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, conversation_id, msg_id, sender_device, outgoing, sent_at, received_at,
-                    status, body
+                    status, body, file_id
              FROM messages
              WHERE conversation_id = ?1 AND outgoing = 1 AND status < 2
              ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map([conversation.0], message_from_row)?;
         rows.map(|r| r?).collect()
+    }
+
+    // --- files -----------------------------------------------------------------------------
+
+    /// Inserts a file transfer (ignored if the id exists).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn insert_file(&self, f: &FileRow) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO files ({FILE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT (file_id) DO NOTHING"
+            ),
+            params![
+                &f.file_id[..],
+                f.conversation.0,
+                f.outgoing,
+                f.name,
+                i64::try_from(f.size).unwrap_or(i64::MAX),
+                &f.key[..],
+                &f.source_device[..],
+                f.manifest,
+                f.path,
+                f.bitmap,
+                f.state as i64,
+                f.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A file transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn file(&self, file_id: &[u8; 32]) -> Result<Option<FileRow>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE file_id = ?1"
+        ))?;
+        stmt.query_row([&file_id[..]], file_from_row)
+            .optional()?
+            .transpose()
+    }
+
+    /// File transfers in one of `states`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error or [`StorageError::InvalidData`].
+    pub fn files_in_state(&self, states: &[FileState]) -> Result<Vec<FileRow>> {
+        let list = states
+            .iter()
+            .map(|s| (*s as i64).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE state IN ({list})"
+        ))?;
+        let rows = stmt.query_map([], file_from_row)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Updates the state, path, manifest and bitmap of a file (`None` keeps the current value).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn update_file(
+        &self,
+        file_id: &[u8; 32],
+        state: Option<FileState>,
+        path: Option<&str>,
+        manifest: Option<&[u8]>,
+        bitmap: Option<&[u8]>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET state = COALESCE(?2, state), path = COALESCE(?3, path),
+                              manifest = COALESCE(?4, manifest), bitmap = COALESCE(?5, bitmap)
+             WHERE file_id = ?1",
+            params![
+                &file_id[..],
+                state.map(|s| s as i64),
+                path,
+                manifest,
+                bitmap
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Contact of a conversation (`None` for group conversations).
+    ///
+    /// # Errors
+    ///
+    /// Returns an SQLite error.
+    pub fn conversation_contact(&self, conversation: ConversationId) -> Result<Option<ContactId>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT contact_id FROM conversations WHERE id = ?1",
+                [conversation.0],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(ContactId))
     }
 
     /// Marks incoming messages of a conversation as read locally and returns their ids
@@ -593,6 +703,7 @@ fn message_from_row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage>> {
     let msg_id: Vec<u8> = r.get(2)?;
     let sender: Vec<u8> = r.get(3)?;
     let status: i64 = r.get(7)?;
+    let file_id: Option<Vec<u8>> = r.get(9)?;
     Ok((|| {
         Ok(StoredMessage {
             id: r.get(0)?,
@@ -604,9 +715,38 @@ fn message_from_row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage>> {
             received_at: r.get(6)?,
             status: MessageStatus::from_i64(status).ok_or(StorageError::InvalidData("status"))?,
             body: r.get(8)?,
+            file_id: file_id.map(|f| to_array(&f, "file id")).transpose()?,
         })
     })())
 }
+
+fn file_from_row(r: &Row<'_>) -> rusqlite::Result<Result<FileRow>> {
+    let id: Vec<u8> = r.get(0)?;
+    let key: Vec<u8> = r.get(5)?;
+    let source: Vec<u8> = r.get(6)?;
+    let state: i64 = r.get(10)?;
+    let size: i64 = r.get(4)?;
+    Ok((|| {
+        Ok(FileRow {
+            file_id: to_array(&id, "file id")?,
+            conversation: ConversationId(r.get(1)?),
+            outgoing: r.get(2)?,
+            name: r.get(3)?,
+            size: u64::try_from(size).map_err(|_| StorageError::InvalidData("size"))?,
+            key: to_array(&key, "file key")?,
+            source_device: to_array(&source, "source device")?,
+            manifest: r.get(7)?,
+            path: r.get(8)?,
+            bitmap: r.get(9)?,
+            state: FileState::from_i64(state).ok_or(StorageError::InvalidData("file state"))?,
+            created_at: r.get(11)?,
+        })
+    })())
+}
+
+const FILE_COLUMNS: &str =
+    "file_id, conversation_id, outgoing, name, size, file_key, source_device,
+                            manifest, path, bitmap, state, created_at";
 
 #[cfg(test)]
 mod tests {
@@ -657,9 +797,9 @@ mod tests {
     #[test]
     fn migrations_are_applied_once() {
         let s = mem();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), crate::migrations::latest());
         s.migrate().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), crate::migrations::latest());
     }
 
     #[test]
@@ -726,6 +866,7 @@ mod tests {
             received_at: None,
             status: MessageStatus::Pending,
             body: String::new(),
+            file_id: None,
         };
         for i in 0..5u8 {
             m.msg_id = [i; 16];
@@ -769,7 +910,60 @@ mod tests {
         };
         s.insert_message(&incoming).unwrap();
         assert_eq!(s.mark_incoming_read(conv).unwrap(), vec![[9; 16]]);
+
         assert!(s.mark_incoming_read(conv).unwrap().is_empty(), "only once");
+
+        // Files.
+        let f = crate::FileRow {
+            file_id: [7; 32],
+            conversation: conv,
+            outgoing: false,
+            name: "clip.mp4".into(),
+            size: 5_000_000_000,
+            key: [8; 32],
+            source_device: [2; 32],
+            manifest: None,
+            path: None,
+            bitmap: None,
+            state: crate::FileState::Offered,
+            created_at: 5,
+        };
+        s.insert_file(&f).unwrap();
+        s.insert_file(&f).unwrap();
+        s.insert_message(&NewMessage {
+            msg_id: [10; 16],
+            file_id: Some([7; 32]),
+            body: "clip.mp4".into(),
+            ..incoming.clone()
+        })
+        .unwrap();
+        assert_eq!(s.messages(conv, None, 1).unwrap()[0].file_id, Some([7; 32]));
+        s.update_file(
+            &[7; 32],
+            Some(crate::FileState::Downloading),
+            Some("/tmp/clip.mp4"),
+            Some(b"m"),
+            Some(&[1]),
+        )
+        .unwrap();
+        s.update_file(&[7; 32], None, None, None, Some(&[3]))
+            .unwrap();
+        let got = s.file(&[7; 32]).unwrap().unwrap();
+        assert_eq!(got.size, 5_000_000_000);
+        assert_eq!(got.path.as_deref(), Some("/tmp/clip.mp4"));
+        assert_eq!(got.bitmap.as_deref(), Some(&[3][..]));
+        assert_eq!(
+            s.files_in_state(&[crate::FileState::Downloading])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            s.files_in_state(&[crate::FileState::Paused])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.conversation_contact(conv).unwrap(), Some(c));
 
         // Key change: a new contact entry (same person, new identity) is merged into the old one.
         let c_new = s

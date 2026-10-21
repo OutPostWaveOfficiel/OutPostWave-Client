@@ -153,3 +153,31 @@ button.danger { color: var(--ow-danger); }
 .server-line { margin-top: 0.75rem; text-align: center; }
 .server-line .row { margin-bottom: 0.25rem; }
 button.inline { padding: 0; color: var(--ow-accent); font-size: inherit; }
+
+/* File transfers */
+.bubble.file { min-width: 260px; max-width: 360px; }
+.file-card { display: flex; flex-direction: column; gap: 0.35rem; }
+.file-head { display: flex; align-items: center; gap: 0.6rem; }
+.file-icon { font-size: 1.6rem; line-height: 1; }
+.file-text { display: flex; flex-direction: column; min-width: 0; }
+.file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-size, .file-status { font-size: 0.8rem; opacity: 0.8; }
+.progress { height: 6px; border-radius: 3px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
+.progress .bar { height: 100%; background: var(--ow-accent); transition: width 0.25s linear; }
+.bubble.out .progress .bar { background: #fff; }
+.progress .bar.idle { opacity: 0.5; }
+.file-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.file-actions button { padding: 0.25rem 0.7rem; font-size: 0.85rem; }
+.bubble.out .file-actions button { color: inherit; border-color: rgba(255, 255, 255, 0.5); background: transparent; }
+.bubble.out .file-actions button.primary { background: #fff; color: var(--ow-accent); }
+.composer .attach { font-size: 1.2rem; padding: 0 0.6rem; }
+.chat { position: relative; }
+.drop-overlay {
+  position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--ow-accent) 18%, transparent);
+  border: 3px dashed var(--ow-accent); font-size: 1.1rem; font-weight: 600; pointer-events: none;
+}
+/* Long conversations: the message list scrolls, the composer stays visible. */
+.layout { grid-template-rows: minmax(0, 1fr); }
+.chat, .messages { min-height: 0; }
+.messages > * { flex-shrink: 0; }

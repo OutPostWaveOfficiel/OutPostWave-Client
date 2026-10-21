@@ -1,4 +1,4 @@
-//! Length-prefixed binary codec for the direct-message protocol.
+//! Length-prefixed binary codec for the direct-message and file protocols.
 //!
 //! Frame: `u32 big-endian length | bytes`. Sizes are capped to bound memory use.
 
@@ -8,14 +8,32 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::StreamProtocol;
 use libp2p::request_response::Codec;
 
-use crate::{MAX_PAYLOAD, MAX_REPLY};
+use crate::{MAX_FILE_REQUEST, MAX_FILE_RESPONSE, MAX_PAYLOAD, MAX_REPLY};
 
 /// Protocol name of direct messages.
 pub(crate) const DM_PROTOCOL: StreamProtocol = StreamProtocol::new("/outpostwave/dm/1");
+/// Protocol name of file transfers (manifests, chunk bitmaps, encrypted chunks).
+pub(crate) const FILE_PROTOCOL: StreamProtocol = StreamProtocol::new("/outpostwave/file/1");
 
-/// Codec carrying opaque byte payloads.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct BytesCodec;
+/// Codec carrying opaque byte payloads, with size caps.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BytesCodec {
+    max_request: usize,
+    max_response: usize,
+}
+
+impl BytesCodec {
+    /// Codec of direct messages.
+    pub(crate) const DM: Self = Self {
+        max_request: MAX_PAYLOAD,
+        max_response: MAX_REPLY,
+    };
+    /// Codec of file transfers.
+    pub(crate) const FILE: Self = Self {
+        max_request: MAX_FILE_REQUEST,
+        max_response: MAX_FILE_RESPONSE,
+    };
+}
 
 async fn read_frame<T: AsyncRead + Unpin + Send>(io: &mut T, max: usize) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
@@ -60,14 +78,14 @@ impl Codec for BytesCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, MAX_PAYLOAD).await
+        read_frame(io, self.max_request).await
     }
 
     async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<Vec<u8>>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, MAX_REPLY).await
+        read_frame(io, self.max_response).await
     }
 
     async fn write_request<T>(
@@ -79,7 +97,7 @@ impl Codec for BytesCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, &req, MAX_PAYLOAD).await
+        write_frame(io, &req, self.max_request).await
     }
 
     async fn write_response<T>(
@@ -91,6 +109,6 @@ impl Codec for BytesCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, &res, MAX_REPLY).await
+        write_frame(io, &res, self.max_response).await
     }
 }

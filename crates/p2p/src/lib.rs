@@ -34,3 +34,7 @@ pub const DEV_RELAY_PORT: u16 = 4001;
 pub const MAX_PAYLOAD: usize = 64 * 1024;
 /// Maximum size of a reply (acknowledgement), in bytes.
 pub const MAX_REPLY: usize = 1024;
+/// Maximum size of a file-protocol request.
+pub const MAX_FILE_REQUEST: usize = 1024;
+/// Maximum size of a file-protocol response (one 1 MiB chunk plus headers).
+pub const MAX_FILE_RESPONSE: usize = 1024 * 1024 + 64 * 1024;

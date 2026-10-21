@@ -12,8 +12,8 @@ use libp2p::{Multiaddr, PeerId, Swarm, identify, identity, mdns, noise, tcp, yam
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroize;
 
-use crate::behaviour::{Behaviour, BehaviourEvent};
-use crate::{MAX_PAYLOAD, P2pConfig, P2pError};
+use crate::behaviour::{Behaviour, BehaviourEvent, RelayServer};
+use crate::{MAX_FILE_REQUEST, MAX_PAYLOAD, P2pConfig, P2pError};
 
 /// Identifies an inbound message to reply to with [`P2pHandle::reply`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,6 +39,15 @@ pub enum P2pEvent {
         peer: PeerId,
         /// Its addresses.
         addrs: Vec<Multiaddr>,
+    },
+    /// A file-protocol request arrived. Answer it with [`P2pHandle::file_reply`].
+    FileRequest {
+        /// Requester.
+        from: PeerId,
+        /// Encoded request.
+        payload: Vec<u8>,
+        /// Token to reply with.
+        token: ReplyToken,
     },
     /// A direct message arrived. Answer it with [`P2pHandle::reply`].
     Message {
@@ -68,6 +77,15 @@ enum Command {
     },
     ListenAddrs {
         done: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    FileRequest {
+        peer: PeerId,
+        payload: Vec<u8>,
+        done: oneshot::Sender<Result<Vec<u8>, P2pError>>,
+    },
+    FileReply {
+        token: ReplyToken,
+        payload: Vec<u8>,
     },
     Shutdown,
 }
@@ -147,6 +165,36 @@ impl P2pHandle {
             .map_err(|_| P2pError::Stopped)
     }
 
+    /// Sends a file-protocol request to `peer` (already connected or dialable) and waits for
+    /// the response.
+    ///
+    /// # Errors
+    ///
+    /// [`P2pError::PayloadTooLarge`], [`P2pError::Send`] on failure or timeout, [`P2pError::Stopped`].
+    pub async fn file_request(&self, peer: PeerId, payload: Vec<u8>) -> Result<Vec<u8>, P2pError> {
+        if payload.len() > MAX_FILE_REQUEST {
+            return Err(P2pError::PayloadTooLarge);
+        }
+        self.call(|done| Command::FileRequest {
+            peer,
+            payload,
+            done,
+        })
+        .await?
+    }
+
+    /// Answers a [`P2pEvent::FileRequest`].
+    ///
+    /// # Errors
+    ///
+    /// [`P2pError::Stopped`] if the node is not running.
+    pub async fn file_reply(&self, token: ReplyToken, payload: Vec<u8>) -> Result<(), P2pError> {
+        self.cmd
+            .send(Command::FileReply { token, payload })
+            .await
+            .map_err(|_| P2pError::Stopped)
+    }
+
     /// Stops the node.
     pub async fn shutdown(&self) {
         let _ = self.cmd.send(Command::Shutdown).await;
@@ -195,10 +243,14 @@ pub fn start(config: P2pConfig) -> Result<(P2pHandle, mpsc::Receiver<P2pEvent>),
     let key = key?;
     let peer_id = key.public().to_peer_id();
     let mdns = config.mdns;
-    let relay_server = config.relay_server;
+    let relay_server = RelayServer {
+        enabled: config.relay_server,
+        max_circuit_bytes: config.relay_max_circuit_bytes,
+        max_circuit_duration: config.relay_max_circuit_duration,
+    };
     // A relay must announce addresses in reservations: without explicit external addresses,
     // announce its listen addresses (fine on a LAN or a server with a public IP).
-    let auto_external = relay_server && config.external_addrs.is_empty();
+    let auto_external = config.relay_server && config.external_addrs.is_empty();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
@@ -287,6 +339,8 @@ struct Node {
     pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), P2pError>>>>,
     pending_sends: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, P2pError>>>,
     inbound: HashMap<ReplyToken, ResponseChannel<Vec<u8>>>,
+    file_sends: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, P2pError>>>,
+    file_inbound: HashMap<ReplyToken, ResponseChannel<Vec<u8>>>,
     next_token: u64,
     auto_external: bool,
 }
@@ -304,6 +358,8 @@ impl Node {
             pending_dials: HashMap::new(),
             pending_sends: HashMap::new(),
             inbound: HashMap::new(),
+            file_sends: HashMap::new(),
+            file_inbound: HashMap::new(),
             next_token: 0,
             auto_external: false,
         }
@@ -350,6 +406,23 @@ impl Node {
                         .swarm
                         .behaviour_mut()
                         .dm
+                        .send_response(channel, payload);
+                }
+            }
+            Command::FileRequest {
+                peer,
+                payload,
+                done,
+            } => {
+                let id = self.swarm.behaviour_mut().file.send_request(&peer, payload);
+                self.file_sends.insert(id, done);
+            }
+            Command::FileReply { token, payload } => {
+                if let Some(channel) = self.file_inbound.remove(&token) {
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .file
                         .send_response(channel, payload);
                 }
             }
@@ -456,6 +529,45 @@ impl Node {
             BehaviourEvent::Dm(request_response::Event::InboundFailure { .. }) => {
                 // The response channel was dropped or timed out: forget stale tokens.
                 self.inbound.retain(|_, ch| ch.is_open());
+            }
+            BehaviourEvent::File(request_response::Event::Message { peer, message, .. }) => {
+                match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        let token = ReplyToken(self.next_token);
+                        self.next_token = self.next_token.wrapping_add(1);
+                        self.file_inbound.insert(token, channel);
+                        let _ = self
+                            .events
+                            .send(P2pEvent::FileRequest {
+                                from: peer,
+                                payload: request,
+                                token,
+                            })
+                            .await;
+                    }
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    } => {
+                        if let Some(done) = self.file_sends.remove(&request_id) {
+                            let _ = done.send(Ok(response));
+                        }
+                    }
+                }
+            }
+            BehaviourEvent::File(request_response::Event::OutboundFailure {
+                request_id,
+                error,
+                ..
+            }) => {
+                if let Some(done) = self.file_sends.remove(&request_id) {
+                    let _ = done.send(Err(P2pError::Send(error.to_string())));
+                }
+            }
+            BehaviourEvent::File(request_response::Event::InboundFailure { .. }) => {
+                self.file_inbound.retain(|_, ch| ch.is_open());
             }
             BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
                 // Feed the DHT with the addresses the peer says it listens on.

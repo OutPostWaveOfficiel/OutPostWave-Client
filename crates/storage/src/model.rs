@@ -110,8 +110,10 @@ pub struct NewMessage {
     pub received_at: Option<i64>,
     /// Initial status.
     pub status: MessageStatus,
-    /// Text content.
+    /// Text content (the file name for a file message).
     pub body: String,
+    /// Attached file (see [`FileRow`]).
+    pub file_id: Option<[u8; 32]>,
 }
 
 /// Stored message.
@@ -133,6 +135,82 @@ pub struct StoredMessage {
     pub received_at: Option<i64>,
     /// Current status.
     pub status: MessageStatus,
-    /// Text content.
+    /// Text content (the file name for a file message).
     pub body: String,
+    /// Attached file (see [`FileRow`]).
+    pub file_id: Option<[u8; 32]>,
+}
+
+/// State of a file transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FileState {
+    /// Offered to us, not downloading.
+    Offered = 0,
+    /// Downloading.
+    Downloading = 1,
+    /// Paused by the user.
+    Paused = 2,
+    /// Waiting for a source to come back online.
+    Waiting = 3,
+    /// Downloaded (incoming) or shared (outgoing).
+    Complete = 4,
+    /// Cancelled or the original was changed/deleted.
+    Failed = 5,
+}
+
+impl FileState {
+    /// Decodes a stored state.
+    #[must_use]
+    pub const fn from_i64(v: i64) -> Option<Self> {
+        Some(match v {
+            0 => Self::Offered,
+            1 => Self::Downloading,
+            2 => Self::Paused,
+            3 => Self::Waiting,
+            4 => Self::Complete,
+            5 => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// A file transfer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileRow {
+    /// File id (BLAKE3 of the manifest).
+    pub file_id: [u8; 32],
+    /// Conversation.
+    pub conversation: ConversationId,
+    /// `true` if we offered it.
+    pub outgoing: bool,
+    /// Display name (sanitized for incoming files).
+    pub name: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Chunk encryption key.
+    pub key: [u8; 32],
+    /// Device that offered the file.
+    pub source_device: [u8; 32],
+    /// Manifest, once known (always for outgoing files).
+    pub manifest: Option<Vec<u8>>,
+    /// Outgoing: original file. Incoming: destination (final path; `.owpart` while downloading).
+    pub path: Option<String>,
+    /// Incoming: chunks received.
+    pub bitmap: Option<Vec<u8>>,
+    /// State.
+    pub state: FileState,
+    /// Creation time (Unix ms).
+    pub created_at: i64,
+}
+
+impl core::fmt::Debug for FileRow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FileRow")
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("outgoing", &self.outgoing)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }

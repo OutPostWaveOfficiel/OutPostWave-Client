@@ -77,6 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             P2pEvent::Message { token, .. } => {
                 let _ = node.reply(token, b"err".to_vec()).await;
             }
+            P2pEvent::FileRequest { token, .. } => {
+                let _ = node.file_reply(token, vec![1]).await;
+            }
             P2pEvent::Discovered { .. } => {}
         }
     }

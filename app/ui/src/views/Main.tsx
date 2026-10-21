@@ -1,12 +1,33 @@
 // Main screen: contact list + conversation.
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import { api, errorText, type Contact, type Invite, type Message, type Settings } from "../api";
+import {
+  api,
+  errorText,
+  type Contact,
+  type FileTransfer,
+  type Invite,
+  type Message,
+  type Settings,
+} from "../api";
 import { Dialog } from "../components/Dialog";
 import { chime, setBadge } from "../notify";
 import { locale, t, type Key } from "../i18n";
 
 const timeFmt = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" });
+const numFmt = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
+
+/** Human-readable size (decimal units, as file managers show them). */
+function formatSize(bytes: number): string {
+  const units = locale.startsWith("fr") ? ["o", "Ko", "Mo", "Go", "To"] : ["B", "kB", "MB", "GB", "TB"];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) {
+    v /= 1000;
+    i++;
+  }
+  return `${numFmt.format(v)} ${units[i]}`;
+}
 
 export function Main(props: { handle: string; os: string; server: string | null }) {
   const [contacts, setContacts] = createSignal<Contact[]>([]);
@@ -77,6 +98,11 @@ export function Main(props: { handle: string; os: string; server: string | null 
               else void loadContacts();
               notify("message");
             }
+          }
+          break;
+        case "file":
+          if (messages[e.contact]) {
+            setMessages(e.contact, (m) => m.file?.fileId === e.file.fileId, "file", e.file);
           }
           break;
         case "status":
@@ -210,7 +236,41 @@ function Conversation(props: {
 }) {
   const [text, setText] = createSignal("");
   const [error, setError] = createSignal("");
+  const [preparing, setPreparing] = createSignal(false);
+  const [dragging, setDragging] = createSignal(false);
   let list: HTMLDivElement | undefined;
+  const name = () => props.contact.displayName ?? props.contact.handle;
+
+  async function sendFiles(action: () => Promise<void>) {
+    setError("");
+    setPreparing(true);
+    try {
+      await action();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setPreparing(false);
+    }
+  }
+
+  // Files dropped on the window (the native drop gives real paths; the browser one does not).
+  onMount(async () => {
+    try {
+      const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+      const unlisten = await getCurrentWebview().onDragDropEvent((e) => {
+        const p = e.payload;
+        if (p.type === "over" || p.type === "enter") setDragging(true);
+        else if (p.type === "leave") setDragging(false);
+        else if (p.type === "drop") {
+          setDragging(false);
+          if (p.paths.length > 0) void sendFiles(() => api.sendFiles(props.contact.id, p.paths));
+        }
+      });
+      onCleanup(unlisten);
+    } catch {
+      // Not running in Tauri (UI preview).
+    }
+  });
 
   // Keep the view scrolled to the newest message.
   createEffect(() => {
@@ -261,8 +321,10 @@ function Conversation(props: {
         </Show>
         <For each={props.messages}>
           {(m) => (
-            <div class="bubble" classList={{ out: m.outgoing }}>
-              <p>{m.body}</p>
+            <div class="bubble" classList={{ out: m.outgoing, file: !!m.file }}>
+              <Show when={m.file} fallback={<p>{m.body}</p>}>
+                {(f) => <FileCard file={f()} contactName={name()} />}
+              </Show>
               <span class="meta">
                 {timeFmt.format(new Date(m.sentAt))}
                 <Show when={m.outgoing}>{` · ${t(`status_${m.status}` as Key)}`}</Show>
@@ -271,7 +333,20 @@ function Conversation(props: {
           )}
         </For>
       </div>
+      <Show when={dragging()}>
+        <div class="drop-overlay">{t("dropHere").replace("{name}", name())}</div>
+      </Show>
       <form class="composer" onSubmit={send}>
+        <button
+          type="button"
+          class="ghost attach"
+          title={t("attach")}
+          aria-label={t("attach")}
+          disabled={preparing()}
+          onClick={() => void sendFiles(() => api.pickAndSendFiles(props.contact.id))}
+        >
+          {preparing() ? "…" : "📎"}
+        </button>
         <input
           value={text()}
           onInput={(e) => setText(e.currentTarget.value)}
@@ -287,6 +362,83 @@ function Conversation(props: {
         <p class="error pad">{error()}</p>
       </Show>
     </>
+  );
+}
+
+function FileCard(props: { file: FileTransfer; contactName: string }) {
+  const f = () => props.file;
+  const pct = () => (f().size > 0 ? Math.min(100, (f().bytes / f().size) * 100) : 100);
+  const act = (p: Promise<void>) => void p.catch(() => {});
+  const status = (): string => {
+    const file = f();
+    if (file.outgoing) {
+      if (file.state === "failed") return t("file_unshared");
+      if (file.bytes >= file.size && file.size > 0 && file.bytes > 0) return t("file_sent");
+      if (file.bytes > 0) return `${t("file_sending")} · ${formatSize(file.bytes)} / ${formatSize(file.size)}`;
+      return t("file_shared").replace("{name}", props.contactName);
+    }
+    switch (file.state) {
+      case "downloading":
+        return `${formatSize(file.bytes)} / ${formatSize(file.size)}${file.rate > 0 ? ` · ${formatSize(file.rate)}/s` : ""}`;
+      case "waiting":
+        return `${t("file_waiting").replace("{name}", props.contactName)} · ${Math.floor(pct())} %`;
+      case "paused":
+        return `${t("file_paused")} · ${Math.floor(pct())} %`;
+      default:
+        return t(`file_${file.state}` as Key);
+    }
+  };
+  const showBar = () => {
+    const file = f();
+    return file.outgoing
+      ? file.bytes > 0 && file.bytes < file.size && file.state !== "failed"
+      : ["downloading", "waiting", "paused"].includes(file.state);
+  };
+
+  return (
+    <div class="file-card">
+      <div class="file-head">
+        <span class="file-icon" aria-hidden="true">📄</span>
+        <div class="file-text">
+          <strong class="file-name" title={f().name}>{f().name}</strong>
+          <span class="file-size">{formatSize(f().size)}</span>
+        </div>
+      </div>
+      <Show when={showBar()}>
+        <div class="progress" role="progressbar" aria-valuenow={Math.floor(pct())} aria-valuemin={0} aria-valuemax={100}>
+          <div class="bar" classList={{ idle: f().state !== "downloading" && !f().outgoing }} style={{ width: `${pct()}%` }} />
+        </div>
+      </Show>
+      <span class="file-status">{status()}</span>
+      <div class="file-actions">
+        <Show when={!f().outgoing}>
+          <Show when={f().state === "offered"}>
+            <button class="primary" onClick={() => act(api.downloadFile(f().fileId))}>{t("download")}</button>
+          </Show>
+          <Show when={f().state === "downloading"}>
+            <button onClick={() => act(api.pauseFile(f().fileId))}>{t("pause")}</button>
+          </Show>
+          <Show when={f().state === "paused"}>
+            <button onClick={() => act(api.downloadFile(f().fileId))}>{t("resume")}</button>
+          </Show>
+          <Show when={f().state === "failed"}>
+            <button onClick={() => act(api.downloadFile(f().fileId))}>{t("retry")}</button>
+          </Show>
+          <Show when={["downloading", "paused", "waiting"].includes(f().state)}>
+            <button class="ghost" onClick={() => act(api.cancelFile(f().fileId))}>{t("cancel")}</button>
+          </Show>
+        </Show>
+        <Show when={f().openable && (f().outgoing || f().state === "complete")}>
+          <Show when={!f().outgoing}>
+            <button class="primary" onClick={() => act(api.openFile(f().fileId, false))}>{t("open")}</button>
+          </Show>
+          <button class="ghost" onClick={() => act(api.openFile(f().fileId, true))}>{t("showInFolder")}</button>
+        </Show>
+        <Show when={f().outgoing && f().state !== "failed" && f().bytes < f().size}>
+          <button class="ghost" onClick={() => act(api.cancelFile(f().fileId))}>{t("cancel")}</button>
+        </Show>
+      </div>
+    </div>
   );
 }
 
