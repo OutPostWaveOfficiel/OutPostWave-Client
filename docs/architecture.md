@@ -1,14 +1,14 @@
 # Client architecture
 
 ```
-app/ui (TypeScript, Vite)  ── Tauri IPC ──  app/src-tauri (ow-app)
+app/ui (SolidJS, Vite)  ──── Tauri IPC ──  app/src-tauri (ow-app)
                                                    │
                                      crates/* (Rust core, shared by all platforms)
 ```
 
 - **Rust core** (`crates/`): one crate per domain, no UI code. Compiles for desktop, mobile and WASM.
 - **`ow-app`**: thin Tauri 2 layer exposing core features as commands/events.
-- **UI**: framework still to be chosen (SolidJS or Svelte); the placeholder is plain TypeScript.
+- **UI**: SolidJS + TypeScript (Vite), chosen for its small runtime and fine-grained reactivity.
 
 | Crate | Role |
 |---|---|
